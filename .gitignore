@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.so
+
+# Virtual environment
+venv/
+env/
+.env
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Account data (sensitive - don't upload!)
+accountInformation.txt
+accounts.txt
+proxies.txt
+cards.txt
+*.db
+
+# Auto_bitbrowser folder (separate project)
+auto_bitbrowser/
+
+# Temp files
+*.log
+*.tmp
+tmpclaude-*
+.claude/
