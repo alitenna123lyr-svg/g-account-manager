@@ -17,15 +17,21 @@ env/
 *.swp
 *.swo
 
-# Account data (sensitive - don't upload!)
+# User data (sensitive - DO NOT upload!)
+2fa_data.json
 accountInformation.txt
 accounts.txt
 proxies.txt
 cards.txt
 *.db
 
-# Auto_bitbrowser folder (separate project)
-auto_bitbrowser/
+# Backup files
+backups/
+
+# Windows temp files
+nul
+Thumbs.db
+Desktop.ini
 
 # Temp files
 *.log
