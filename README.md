@@ -1,6 +1,7 @@
 # G-Account Manager
 
 [English](#english) | [中文](#中文)
+![Uploading image.png…]()
 
 ---
 
