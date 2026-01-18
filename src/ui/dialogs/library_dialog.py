@@ -13,7 +13,7 @@ from PyQt6.QtGui import QIcon
 
 from ...services.library_service import LibraryService, LibraryInfo
 from ..theme import get_theme
-from ..icons_new import icon_library, icon_edit, icon_trash, icon_plus
+from ..icons import icon_library, icon_edit, icon_trash, icon_plus
 
 
 class LibraryDialog(QDialog):

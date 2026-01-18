@@ -14,7 +14,7 @@ from PyQt6.QtGui import QIcon
 from ...models.account import Account
 from ...models.group import Group
 from ..theme import get_theme, get_theme_manager
-from ..icons_new import icon_eye, icon_eye_off, icon_user, icon_plus
+from ..icons import icon_eye, icon_eye_off, icon_user, icon_plus
 
 
 class AccountDialog(QDialog):

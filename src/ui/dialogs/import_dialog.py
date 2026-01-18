@@ -16,7 +16,7 @@ from PyQt6.QtGui import QIcon, QColor
 from ...models.account import Account
 from ...services.import_service import get_import_service
 from ..theme import get_theme, get_theme_manager
-from ..icons_new import icon_import, icon_file
+from ..icons import icon_import, icon_file
 
 
 class ImportDialog(QDialog):
