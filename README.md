@@ -1,7 +1,9 @@
 # G-Account Manager
 
 [English](#english) | [中文](#中文)
-![Uploading image.png…]()
+---
+<img width="2560" height="1504" alt="image" src="https://github.com/user-attachments/assets/75128071-fcf2-490c-b750-5382629d2826" />
+
 
 ---
 
