@@ -120,6 +120,13 @@ class AccountDialog(QDialog):
             "可选" if zh else "Optional"
         )
 
+        # Backup email field
+        self.backup_input = self._create_field(
+            form_layout,
+            "辅助邮箱" if zh else "Backup Email",
+            "可选" if zh else "Optional"
+        )
+
         # Secret key field
         self.secret_input = self._create_password_field(
             form_layout,
@@ -370,6 +377,9 @@ class AccountDialog(QDialog):
         if self.account.password:
             self.password_input.setText(self.account.password)
 
+        if self.account.backup:
+            self.backup_input.setText(self.account.backup)
+
         if self.account.secret:
             self.secret_input.setText(self.account.secret)
 
@@ -388,9 +398,10 @@ class AccountDialog(QDialog):
             self.email_input.setFocus()
             return
 
-        password = self.password_input.text().strip() or None
-        secret = self.secret_input.text().strip() or None
-        notes = self.notes_input.text().strip() or None
+        password = self.password_input.text().strip()
+        backup = self.backup_input.text().strip()
+        secret = self.secret_input.text().strip()
+        notes = self.notes_input.text().strip()
 
         group = self.group_combo.currentData()
         groups = [group] if group else []
@@ -399,6 +410,7 @@ class AccountDialog(QDialog):
             # Update existing account
             self.account.email = email
             self.account.password = password
+            self.account.backup = backup
             self.account.secret = secret
             self.account.notes = notes
             self.account.groups = groups
@@ -408,6 +420,7 @@ class AccountDialog(QDialog):
             self.result_account = Account(
                 email=email,
                 password=password,
+                backup=backup,
                 secret=secret,
                 notes=notes,
                 groups=groups
