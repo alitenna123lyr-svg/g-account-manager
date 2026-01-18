@@ -4,36 +4,53 @@ Constants used throughout the application.
 
 from typing import Final
 
-# Available color icons for custom groups (12 distinct colors)
+# Available colors for groups - Light mode (Tailwind 600 - deeper, more mature)
 GROUP_COLORS: Final[dict[str, str]] = {
-    'red': '#EF4444',
-    'orange': '#F97316',
-    'yellow': '#EAB308',
-    'lime': '#84CC16',
-    'green': '#22C55E',
-    'teal': '#14B8A6',
-    'cyan': '#06B6D4',
-    'blue': '#3B82F6',
-    'indigo': '#6366F1',
-    'purple': '#8B5CF6',
-    'pink': '#EC4899',
-    'gray': '#6B7280',
+    'red': '#DC2626',
+    'orange': '#EA580C',
+    'amber': '#D97706',
+    'yellow': '#CA8A04',
+    'lime': '#65A30D',
+    'green': '#16A34A',
+    'teal': '#0D9488',
+    'cyan': '#0891B2',
+    'blue': '#2563EB',
+    'indigo': '#4F46E5',
+    'purple': '#9333EA',
+    'pink': '#DB2777',
 }
 
-# Pastel fill colors for icons (Tailwind 300 level - soft but visible)
+# Dark mode colors (Tailwind 400 - brighter for dark backgrounds)
+GROUP_COLORS_DARK: Final[dict[str, str]] = {
+    'red': '#F87171',
+    'orange': '#FB923C',
+    'amber': '#FBBF24',
+    'yellow': '#FACC15',
+    'lime': '#A3E635',
+    'green': '#4ADE80',
+    'teal': '#2DD4BF',
+    'cyan': '#22D3EE',
+    'blue': '#60A5FA',
+    'indigo': '#818CF8',
+    'purple': '#C084FC',
+    'pink': '#F472B6',
+}
+
+# Pastel fill colors for icons (Tailwind 200 level - soft but visible)
+# Maps from 600-level colors to 200-level pastels
 GROUP_COLORS_PASTEL: Final[dict[str, str]] = {
-    '#EF4444': '#fca5a5',  # red
-    '#F97316': '#fdba74',  # orange
-    '#EAB308': '#fde047',  # yellow
-    '#84CC16': '#bef264',  # lime
-    '#22C55E': '#86efac',  # green
-    '#14B8A6': '#5eead4',  # teal
-    '#06B6D4': '#67e8f9',  # cyan
-    '#3B82F6': '#93c5fd',  # blue
-    '#6366F1': '#a5b4fc',  # indigo
-    '#8B5CF6': '#c4b5fd',  # purple
-    '#EC4899': '#f9a8d4',  # pink
-    '#6B7280': '#d1d5db',  # gray
+    '#DC2626': '#FECACA',  # red
+    '#EA580C': '#FED7AA',  # orange
+    '#D97706': '#FDE68A',  # amber
+    '#CA8A04': '#FEF08A',  # yellow
+    '#65A30D': '#D9F99D',  # lime
+    '#16A34A': '#BBF7D0',  # green
+    '#0D9488': '#99F6E4',  # teal
+    '#0891B2': '#A5F3FC',  # cyan
+    '#2563EB': '#BFDBFE',  # blue
+    '#4F46E5': '#C7D2FE',  # indigo
+    '#9333EA': '#E9D5FF',  # purple
+    '#DB2777': '#FBCFE8',  # pink
 }
 
 GROUP_COLOR_NAMES: Final[list[str]] = list(GROUP_COLORS.keys())

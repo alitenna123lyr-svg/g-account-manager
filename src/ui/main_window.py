@@ -1,2540 +1,7161 @@
 """
-Main window for G-Account Manager.
-This is the refactored version using the new service layer.
+G-Account Manager - Main Window v2
+Modern minimal design with library management and archive features.
 """
 
-import sys
-from pathlib import Path
-from typing import Optional
+import logging
+from typing import Optional, List, Dict, Set
+import time
 
 from PyQt6.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QLabel, QPushButton, QTableWidget, QTableWidgetItem, QHeaderView,
-    QFileDialog, QMessageBox, QProgressBar, QPlainTextEdit,
-    QAbstractItemView, QDialog, QSplitter, QListWidget, QListWidgetItem,
-    QCheckBox, QFrame, QMenu, QInputDialog, QToolButton,
-    QSizePolicy, QLineEdit, QGridLayout, QColorDialog, QWidgetAction
+    QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
+    QLineEdit, QFrame, QScrollArea, QMenu, QApplication, QProgressBar,
+    QDialog, QListWidget, QListWidgetItem, QMessageBox, QInputDialog, QCheckBox,
+    QWidgetAction, QGraphicsDropShadowEffect, QToolButton, QTextEdit,
+    QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView
 )
-from PyQt6.QtCore import Qt, QTimer, QSize, QMimeData
-from PyQt6.QtGui import QFont, QColor, QIcon, QFontMetrics, QDrag
+from PyQt6.QtCore import Qt, QTimer, QPropertyAnimation, QEasingCurve, pyqtProperty, pyqtSignal, QSize
+from PyQt6.QtGui import QIcon, QColor, QCursor, QBrush, QPalette
 
-from ..config.settings import Settings
-from ..config.translations import TRANSLATIONS, get_translation
-from ..config.constants import GROUP_COLORS, get_color_hex
 from ..models.app_state import AppState
 from ..models.account import Account
 from ..models.group import Group
-from ..services.totp_service import TotpService, get_totp_service
-from ..services.time_service import get_accurate_time
-from ..services.data_service import DataService
-from ..services.account_service import AccountService
-from ..services.group_service import GroupService
-from ..services.import_service import ImportService
-from ..services.backup_service import BackupService
-from ..utils.logger import get_logger
+from ..services.totp_service import get_totp_service
+from ..services.time_service import get_time_service
+from ..services.library_service import LibraryService, LibraryInfo
+from ..services.archive_service import get_archive_service, ArchiveInfo
+from ..config.translations import get_translation
+
+from .dialogs.tag_editor_dialog import TagEditorDialog
+from .theme import get_theme_manager, get_theme
 from .icons import (
-    create_color_icon, create_tag_icon, create_dot_icon, create_arrow_icon, create_list_icon,
-    create_folder_icon, create_trash_icon, create_plus_icon,
-    create_import_icon, create_clear_icon, create_lock_icon,
-    create_clock_icon, create_minus_icon, create_check_icon, create_close_icon,
-    create_edit_icon, create_restore_icon, get_pastel_color,
+    icon_key, icon_search, icon_sun, icon_moon, icon_settings,
+    icon_plus, icon_copy, icon_eye, icon_eye_off, icon_edit, icon_trash,
+    icon_user, icon_briefcase, icon_users, icon_wallet, icon_check,
+    icon_chevron_down, icon_archive, icon_library, icon_import, icon_export,
+    icon_checkbox, icon_checkbox_empty, icon_list, icon_grid, icon_square_plus, icon_square_minus,
+    icon_library_move, icon_arrow_up, icon_arrow_down,
+    icon_mail, icon_refresh, icon_close
 )
-from .widgets.toast import ToastNotification
-from .dialogs.duplicate_dialog import DuplicateConflictDialog
 
-logger = get_logger(__name__)
-
-# 获取 check.svg 的绝对路径（项目根目录）
-CHECK_SVG_PATH = str(Path(__file__).parent.parent.parent / "check.svg").replace("\\", "/")
+logger = logging.getLogger(__name__)
 
 
-class DraggableGroupList(QListWidget):
-    """Custom QListWidget that calls a callback after drag-drop reordering"""
-    def __init__(self, reorder_callback, parent=None):
+class SelectionManager:
+    """Unified multi-selection logic manager.
+
+    Uses object id for selection tracking to handle Account objects that
+    may have __eq__ based on content (e.g., same email = equal).
+
+    Selection behavior:
+    - Normal click: Toggle current item (add/remove), update anchor
+    - Shift+Click: Add range from anchor to current
+    """
+
+    def __init__(self):
+        # Use dict with id(account) -> account to track by object identity
+        self._selected: Dict[int, Account] = {}
+        self._anchor_index: Optional[int] = None
+
+    @property
+    def count(self) -> int:
+        """Get the count of selected accounts."""
+        return len(self._selected)
+
+    @property
+    def items(self) -> List[Account]:
+        """Get selected accounts as a list."""
+        return list(self._selected.values())
+
+    @property
+    def anchor_index(self) -> Optional[int]:
+        """Get the current anchor index for range selection."""
+        return self._anchor_index
+
+    def is_selected(self, account: Account) -> bool:
+        """Check if an account is selected (by object identity)."""
+        if account is None:
+            return False
+        return id(account) in self._selected
+
+    def clear(self) -> None:
+        """Clear all selections and reset anchor."""
+        self._selected.clear()
+        self._anchor_index = None
+
+    def toggle(self, account: Account, index: int) -> None:
+        """Toggle current item selection, update anchor."""
+        acc_id = id(account)
+        if acc_id in self._selected:
+            del self._selected[acc_id]
+        else:
+            self._selected[acc_id] = account
+        self._anchor_index = index
+
+    def select_range(self, accounts_list: List[Account], target_index: int) -> None:
+        """Shift+Click: Add range from anchor to target (inclusive)."""
+        if self._anchor_index is None:
+            # No anchor - just toggle single
+            if target_index < len(accounts_list):
+                self.toggle(accounts_list[target_index], target_index)
+            return
+
+        # Add range from anchor to target (don't clear existing)
+        start = min(self._anchor_index, target_index)
+        end = max(self._anchor_index, target_index)
+
+        for i in range(start, end + 1):
+            if i < len(accounts_list):
+                acc = accounts_list[i]
+                self._selected[id(acc)] = acc
+
+        # Don't update anchor on Shift+click (keep original anchor)
+
+    def handle_click(self, account: Account, index: int, accounts_list: List[Account],
+                     shift_held: bool) -> None:
+        """Handle a click.
+
+        Args:
+            account: The clicked account
+            index: The index of the clicked account
+            accounts_list: The full ordered list of accounts
+            shift_held: Whether Shift key was held
+        """
+        if shift_held:
+            self.select_range(accounts_list, index)
+        else:
+            self.toggle(account, index)
+
+    def set_all(self, accounts: List[Account]) -> None:
+        """Select all accounts from a list."""
+        self._selected = {id(acc): acc for acc in accounts}
+        self._anchor_index = None
+
+
+class FlowLayout(QVBoxLayout):
+    """A simple flow layout that wraps widgets to new lines."""
+
+    def __init__(self, parent=None, spacing=6):
         super().__init__(parent)
-        self.reorder_callback = reorder_callback
+        self._spacing = spacing
+        self._rows = []
+        self.setSpacing(spacing)
+        self.setContentsMargins(0, 0, 0, 0)
 
-    def dropEvent(self, event):
-        super().dropEvent(event)
-        # Call the reorder callback after the drop is complete
-        if self.reorder_callback:
-            QTimer.singleShot(0, self.reorder_callback)
+    def addWidget(self, widget):
+        """Add widget - will be arranged in flow on next layout."""
+        if not self._rows:
+            self._rows.append([])
+        self._rows[-1].append(widget)
+
+    def apply_layout(self, max_width: int):
+        """Apply the flow layout with given max width."""
+        # Clear existing layouts
+        while self.count():
+            item = self.takeAt(0)
+            if item.layout():
+                while item.layout().count():
+                    item.layout().takeAt(0)
+
+        # Rebuild rows based on width
+        all_widgets = []
+        for row in self._rows:
+            all_widgets.extend(row)
+
+        self._rows = []
+        current_row = []
+        current_width = 0
+
+        for widget in all_widgets:
+            widget_width = widget.sizeHint().width()
+            if current_width + widget_width + self._spacing > max_width and current_row:
+                self._rows.append(current_row)
+                current_row = [widget]
+                current_width = widget_width
+            else:
+                current_row.append(widget)
+                current_width += widget_width + self._spacing
+
+        if current_row:
+            self._rows.append(current_row)
+
+        # Create row layouts
+        for row in self._rows:
+            row_layout = QHBoxLayout()
+            row_layout.setSpacing(self._spacing)
+            row_layout.setContentsMargins(0, 0, 0, 0)
+            for widget in row:
+                row_layout.addWidget(widget)
+            row_layout.addStretch()
+            super().addLayout(row_layout)
 
 
-class DragHandle(QLabel):
-    """Custom drag handle that initiates drag on the parent QListWidget"""
-    def __init__(self, list_widget, list_item, parent=None):
-        super().__init__("⋮⋮", parent)
-        self.list_widget = list_widget
-        self.list_item = list_item
-        self.drag_start_pos = None
-        self.setFixedWidth(20)
-        self.setStyleSheet("color: #9CA3AF; font-size: 14px; font-weight: bold; background: transparent; border: none;")
-        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.setCursor(Qt.CursorShape.SizeAllCursor)
+class ClickableFrame(QFrame):
+    """A QFrame that emits signals when clicked."""
+    clicked = pyqtSignal()  # Simple click signal
+    rightClicked = pyqtSignal(object)  # Passes the global position
 
     def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.RightButton:
+            self.rightClicked.emit(event.globalPosition().toPoint())
+        elif event.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit()
+        # Don't call super() to avoid issues with widget deletion during signal handling
+
+
+class ToastWidget(QFrame):
+    """Toast notification widget with optional action button and iOS-style frosted glass effect."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("toast")
+        self.setVisible(False)
+        self.setFixedHeight(44)
+
+        self._layout = QHBoxLayout(self)
+        self._layout.setContentsMargins(20, 0, 20, 0)
+        self._layout.setSpacing(12)
+
+        self._label = QLabel()
+        self._label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._layout.addWidget(self._label, 1)
+
+        self._action_btn = QPushButton()
+        self._action_btn.setVisible(False)
+        self._action_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._layout.addWidget(self._action_btn)
+
+        self._hide_timer = QTimer(self)
+        self._hide_timer.setSingleShot(True)
+        self._hide_timer.timeout.connect(self._on_timeout)
+
+        self._action_callback = None
+
+    def show_message(self, message: str, duration: int = 2000, action_text: str = None, action_callback=None, center: bool = False):
+        """Show a toast message with optional action button.
+
+        Args:
+            message: The message to display
+            duration: How long to show the message (ms)
+            action_text: Optional action button text
+            action_callback: Optional callback when action is clicked
+            center: If True, show in center; if False, show at bottom
+        """
+        self._label.setText(message)
+        self._action_callback = action_callback
+
+        # Show/hide action button
+        if action_text and action_callback:
+            self._action_btn.setText(action_text)
+            self._action_btn.setVisible(True)
+            try:
+                self._action_btn.clicked.disconnect()
+            except:
+                pass
+            self._action_btn.clicked.connect(self._on_action_clicked)
+        else:
+            self._action_btn.setVisible(False)
+
+        self.setVisible(True)
+        self.adjustSize()
+
+        # Position toast
+        if self.parent():
+            parent_rect = self.parent().rect()
+            x = (parent_rect.width() - self.width()) // 2
+            if center:
+                y = (parent_rect.height() - self.height()) // 2
+            else:
+                y = parent_rect.height() - self.height() - 40  # 40px from bottom
+            self.move(x, y)
+
+        # Auto hide
+        self._hide_timer.stop()
+        self._hide_timer.start(duration)
+
+    def _on_action_clicked(self):
+        """Handle action button click."""
+        self._hide_timer.stop()
+        self.hide()
+        if self._action_callback:
+            self._action_callback()
+
+    def _on_timeout(self):
+        """Handle timeout - clear undo data."""
+        self.hide()
+        self._action_callback = None
+
+
+class BounceScrollArea(QScrollArea):
+    """QScrollArea with iOS-style elastic rubber band effect.
+
+    Uses Apple's rubber band formula with smooth interpolation
+    to decouple visual smoothness from mouse input frequency.
+    """
+
+    RUBBER_BAND_CONSTANT = 0.55  # Apple's constant
+    LERP_FACTOR = 0.3  # Interpolation speed (balanced)
+    MAX_STRETCH = 75  # Maximum visual stretch in pixels
+
+    def __init__(self, parent=None, bottom_only: bool = False):
+        super().__init__(parent)
+        self._base_bottom_margin = 0
+        self._visual_offset = 0.0  # Current displayed offset
+        self._target_offset = 0.0  # Target offset (from rubber band formula)
+        self._raw_scroll = 0.0  # Accumulated scroll beyond edge
+        self._is_stretching = False  # Whether user is actively stretching
+        self._bottom_only = bottom_only  # Only bounce at bottom, not top
+
+        # Smooth interpolation timer (60fps)
+        self._lerp_timer = QTimer(self)
+        self._lerp_timer.setInterval(16)  # ~60fps
+        self._lerp_timer.timeout.connect(self._update_lerp)
+
+        # Timer to detect when user stops scrolling
+        self._scroll_stop_timer = QTimer(self)
+        self._scroll_stop_timer.setSingleShot(True)
+        self._scroll_stop_timer.timeout.connect(self._start_bounce_back)
+
+    def _rubber_band(self, x: float, d: float) -> float:
+        """Apply Apple's rubber band formula."""
+        c = self.RUBBER_BAND_CONSTANT
+        if d == 0:
+            return 0
+        return (1.0 - (1.0 / ((abs(x) * c / d) + 1.0))) * d
+
+    def _update_lerp(self):
+        """Smoothly interpolate visual offset towards target."""
+        diff = self._target_offset - self._visual_offset
+
+        if abs(diff) < 0.5:
+            # Close enough, snap to target
+            self._visual_offset = self._target_offset
+            self._apply_offset()
+            # Stop timer if we've settled at 0
+            if abs(self._target_offset) < 0.5 and not self._is_stretching:
+                self._lerp_timer.stop()
+            return
+
+        # Smooth interpolation
+        self._visual_offset += diff * self.LERP_FACTOR
+        self._apply_offset()
+
+    def _apply_offset(self):
+        """Apply the current visual offset to the widget margins."""
+        widget = self.widget()
+        if widget:
+            offset = int(self._visual_offset)
+            if offset >= 0:
+                widget.setContentsMargins(0, offset, 0, self._base_bottom_margin)
+            else:
+                widget.setContentsMargins(0, 0, 0, self._base_bottom_margin - offset)
+
+    def _start_bounce_back(self):
+        """Start bounce back by setting target to 0."""
+        self._is_stretching = False
+        self._target_offset = 0.0
+        self._raw_scroll = 0.0
+        # Ensure lerp timer is running
+        if not self._lerp_timer.isActive():
+            self._lerp_timer.start()
+
+    def wheelEvent(self, event):
+        """Handle wheel events with iOS-style rubber band effect."""
+        scrollbar = self.verticalScrollBar()
+        delta = event.angleDelta().y()
+
+        at_top = scrollbar.value() <= scrollbar.minimum()
+        at_bottom = scrollbar.value() >= scrollbar.maximum()
+
+        # Check if at boundary and scrolling beyond
+        # If bottom_only, skip top bounce
+        should_bounce_top = at_top and delta > 0 and not self._bottom_only
+        should_bounce_bottom = at_bottom and delta < 0
+
+        if should_bounce_top or should_bounce_bottom:
+            self._is_stretching = True
+
+            # Get viewport dimension for the formula
+            d = self.viewport().height()
+
+            # Accumulate raw scroll distance
+            self._raw_scroll += delta * 0.4
+            # Limit raw scroll to reasonable range
+            max_raw = d  # Reasonable limit
+            self._raw_scroll = max(-max_raw, min(max_raw, self._raw_scroll))
+
+            # Apply rubber band formula to get target offset
+            target = self._rubber_band(self._raw_scroll, d)
+
+            # Clamp to maximum stretch
+            target = min(target, self.MAX_STRETCH)
+
+            # Apply sign based on direction
+            if self._raw_scroll < 0:
+                target = -target
+
+            self._target_offset = target
+
+            # Start lerp timer if not running
+            if not self._lerp_timer.isActive():
+                self._lerp_timer.start()
+
+            # When close to max stretch, bounce back faster to avoid "stuck" feeling
+            stretch_ratio = abs(target) / self.MAX_STRETCH
+            if stretch_ratio > 0.85:
+                # Near max - quick bounce back
+                self._scroll_stop_timer.start(50)
+            else:
+                self._scroll_stop_timer.start(120)
+
+            event.accept()
+            return
+
+        # If returning to normal scrolling, trigger bounce back
+        if abs(self._visual_offset) > 0.5:
+            self._scroll_stop_timer.start(50)
+
+        super().wheelEvent(event)
+
+
+class BounceTableWidget(QTableWidget):
+    """QTableWidget with iOS-style elastic rubber band effect.
+
+    Uses viewport geometry manipulation to create the bounce effect.
+    """
+
+    RUBBER_BAND_CONSTANT = 0.55  # Apple's constant
+    LERP_FACTOR = 0.25  # Interpolation speed (smoother)
+    MAX_STRETCH = 80  # Maximum visual stretch in pixels
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._visual_offset = 0.0
+        self._target_offset = 0.0
+        self._raw_scroll = 0.0
+        self._is_stretching = False
+        self._base_viewport_y = 0
+
+        # Enable pixel-based scrolling for smoother effect
+        self.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+        self.setHorizontalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+
+        # Smooth interpolation timer (60fps)
+        self._lerp_timer = QTimer(self)
+        self._lerp_timer.setInterval(16)
+        self._lerp_timer.timeout.connect(self._update_lerp)
+
+        # Timer to detect when user stops scrolling
+        self._scroll_stop_timer = QTimer(self)
+        self._scroll_stop_timer.setSingleShot(True)
+        self._scroll_stop_timer.timeout.connect(self._start_bounce_back)
+
+    def showEvent(self, event):
+        """Capture base viewport position on show."""
+        super().showEvent(event)
+        self._base_viewport_y = self.viewport().y()
+
+    def _rubber_band(self, x: float, d: float) -> float:
+        """Apply Apple's rubber band formula."""
+        c = self.RUBBER_BAND_CONSTANT
+        if d == 0:
+            return 0
+        return (1.0 - (1.0 / ((abs(x) * c / d) + 1.0))) * d
+
+    def _update_lerp(self):
+        """Smoothly interpolate visual offset towards target."""
+        diff = self._target_offset - self._visual_offset
+
+        if abs(diff) < 0.5:
+            self._visual_offset = self._target_offset
+            self._apply_visual_offset()
+            if abs(self._target_offset) < 0.5 and not self._is_stretching:
+                self._lerp_timer.stop()
+            return
+
+        self._visual_offset += diff * self.LERP_FACTOR
+        self._apply_visual_offset()
+
+    def _apply_visual_offset(self):
+        """Apply the current visual offset by moving viewport."""
+        offset = int(self._visual_offset)
+        viewport = self.viewport()
+        # Move viewport position to create visual offset effect
+        current_geo = viewport.geometry()
+        new_y = self._base_viewport_y + offset
+        viewport.setGeometry(current_geo.x(), new_y, current_geo.width(), current_geo.height())
+
+    def _start_bounce_back(self):
+        """Start bounce back by setting target to 0."""
+        self._is_stretching = False
+        self._target_offset = 0.0
+        self._raw_scroll = 0.0
+        if not self._lerp_timer.isActive():
+            self._lerp_timer.start()
+
+    def resizeEvent(self, event):
+        """Update base viewport position on resize."""
+        super().resizeEvent(event)
+        if self._visual_offset == 0:
+            self._base_viewport_y = self.viewport().y()
+
+    def wheelEvent(self, event):
+        """Handle wheel events with iOS-style rubber band effect."""
+        scrollbar = self.verticalScrollBar()
+        delta = event.angleDelta().y()
+
+        at_top = scrollbar.value() <= scrollbar.minimum()
+        at_bottom = scrollbar.value() >= scrollbar.maximum()
+
+        # Check if at boundary and scrolling beyond
+        if (at_top and delta > 0) or (at_bottom and delta < 0):
+            self._is_stretching = True
+
+            d = self.viewport().height()
+
+            self._raw_scroll += delta * 0.5
+            max_raw = d
+            self._raw_scroll = max(-max_raw, min(max_raw, self._raw_scroll))
+
+            target = self._rubber_band(self._raw_scroll, d)
+            target = min(target, self.MAX_STRETCH)
+
+            if self._raw_scroll < 0:
+                target = -target
+
+            self._target_offset = target
+
+            if not self._lerp_timer.isActive():
+                self._lerp_timer.start()
+
+            stretch_ratio = abs(target) / self.MAX_STRETCH
+            if stretch_ratio > 0.85:
+                self._scroll_stop_timer.start(50)
+            else:
+                self._scroll_stop_timer.start(150)
+
+            event.accept()
+            return
+
+        if abs(self._visual_offset) > 0.5:
+            self._scroll_stop_timer.start(50)
+
+        super().wheelEvent(event)
+
+
+class GroupButton(QFrame):
+    """A clickable group button with colored dot indicator."""
+
+    clicked = pyqtSignal()
+    rightClicked = pyqtSignal(object)  # Emits the global position
+
+    def __init__(self, name: str, count: int, color_hex: str = None, is_all: bool = False, parent=None):
+        super().__init__(parent)
+        self.group_name = name
+        self.color_hex = color_hex
+        self.is_all = is_all  # "All Accounts" uses icon instead of dot
+        self._selected = False
+
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setFixedHeight(36)
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(12, 0, 12, 0)
+        layout.setSpacing(10)
+
+        # Color dot or icon
+        if is_all:
+            # Use key icon for "All Accounts"
+            self.icon_label = QLabel()
+            self.icon_label.setFixedSize(16, 16)
+            layout.addWidget(self.icon_label)
+            self.dot_label = None
+        else:
+            # Use colored dot for groups
+            self.dot_label = QLabel()
+            self.dot_label.setFixedSize(10, 10)
+            layout.addWidget(self.dot_label)
+            self.icon_label = None
+
+        # Name label
+        self.name_label = QLabel(name)
+        self.name_label.setObjectName("groupName")
+        layout.addWidget(self.name_label, 1)
+
+        # Count label
+        self.count_label = QLabel(f"({count})")
+        self.count_label.setObjectName("groupCount")
+        layout.addWidget(self.count_label)
+
+        self._apply_style()
+
+    def set_selected(self, selected: bool):
+        """Set selection state."""
+        self._selected = selected
+        self._apply_style()
+
+    def set_count(self, count: int):
+        """Update the count."""
+        self.count_label.setText(f"({count})")
+
+    def _apply_style(self):
+        """Apply current theme style."""
+        t = get_theme()
+
+        # Small square dot for all groups
+        # Light mode: pure black, Dark mode: softer gray
+        is_dark = get_theme_manager().is_dark
+        dot_color = "#6B7280" if is_dark else t.text_primary  # Gray-500 for dark mode
+        if self.dot_label:
+            self.dot_label.setStyleSheet(f"""
+                background-color: {dot_color};
+                border-radius: 2px;
+            """)
+
+        # Icon for "All Accounts"
+        if self.icon_label:
+            pixmap = QIcon(icon_key(16, t.text_secondary if not self._selected else t.text_primary)).pixmap(16, 16)
+            self.icon_label.setPixmap(pixmap)
+
+        # Frame style
+        if self._selected:
+            self.setStyleSheet(f"""
+                GroupButton {{
+                    background-color: {t.bg_hover};
+                    border: none;
+                    border-radius: 6px;
+                }}
+            """)
+            self.name_label.setStyleSheet(f"""
+                font-size: 13px;
+                font-weight: 500;
+                color: {t.text_primary};
+                background: transparent;
+            """)
+        else:
+            self.setStyleSheet(f"""
+                GroupButton {{
+                    background-color: transparent;
+                    border: none;
+                    border-radius: 6px;
+                }}
+                GroupButton:hover {{
+                    background-color: {t.bg_hover};
+                }}
+            """)
+            self.name_label.setStyleSheet(f"""
+                font-size: 13px;
+                color: {t.text_secondary};
+                background: transparent;
+            """)
+
+        self.count_label.setStyleSheet(f"""
+            font-size: 12px;
+            color: {t.text_tertiary};
+            background: transparent;
+        """)
+
+    def mousePressEvent(self, event):
+        """Handle mouse press."""
         if event.button() == Qt.MouseButton.LeftButton:
-            self.drag_start_pos = event.pos()
-            # Select the item in the list
-            self.list_widget.setCurrentItem(self.list_item)
+            self.clicked.emit()
+        elif event.button() == Qt.MouseButton.RightButton:
+            self.rightClicked.emit(event.globalPosition().toPoint())
+        super().mousePressEvent(event)
+
+    def enterEvent(self, event):
+        """Handle mouse enter for hover effect."""
+        if not self._selected:
+            t = get_theme()
+            self.setStyleSheet(f"""
+                GroupButton {{
+                    background-color: {t.bg_hover};
+                    border: none;
+                    border-radius: 6px;
+                }}
+            """)
+            self.name_label.setStyleSheet(f"""
+                font-size: 13px;
+                color: {t.text_primary};
+                background: transparent;
+            """)
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        """Handle mouse leave."""
+        self._apply_style()
+        super().leaveEvent(event)
+
+
+class EditableGroupItem(QFrame):
+    """An editable group item for inline editing with drag support."""
+
+    deleted = pyqtSignal(str)  # Emits group name when deleted
+    name_changed = pyqtSignal(str, str)  # Emits (old_name, new_name)
+    drag_started = pyqtSignal(object)  # Emits self when drag starts
+    dropped = pyqtSignal(object, object)  # Emits (dragged_item, target_item)
+
+    def __init__(self, group: Group, is_dark: bool = False, parent=None):
+        super().__init__(parent)
+        self.group = group
+        self.is_dark = is_dark
+        self._drag_start_pos = None
+        self._is_dragging = False
+        self._drop_at_top = False
+
+        self.setFixedHeight(36)
+        self.setAcceptDrops(True)
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(8, 0, 8, 0)
+        layout.setSpacing(8)
+
+        # Drag handle (6-dot grip)
+        self.drag_handle = QLabel("⋮⋮")
+        self.drag_handle.setFixedWidth(16)
+        self.drag_handle.setCursor(Qt.CursorShape.OpenHandCursor)
+        self.drag_handle.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self.drag_handle)
+
+        # Black dot
+        self.dot_label = QLabel()
+        self.dot_label.setFixedSize(8, 8)
+        layout.addWidget(self.dot_label)
+
+        # Name input - seamless editing
+        self.name_input = QLineEdit(group.name)
+        self.name_input.setObjectName("groupNameInput")
+        self.name_input.editingFinished.connect(self._on_name_changed)
+        self.name_input.returnPressed.connect(self._on_enter_pressed)
+        layout.addWidget(self.name_input, 1)
+
+        # Delete button
+        self.delete_btn = QPushButton("×")
+        self.delete_btn.setFixedSize(20, 20)
+        self.delete_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.delete_btn.clicked.connect(lambda: self.deleted.emit(self.group.name))
+        layout.addWidget(self.delete_btn)
+
+        self._apply_style()
+
+    def _on_name_changed(self):
+        """Handle name change."""
+        new_name = self.name_input.text().strip()
+        if new_name and new_name != self.group.name:
+            old_name = self.group.name
+            self.name_changed.emit(old_name, new_name)
+
+    def _on_enter_pressed(self):
+        """Handle Enter key - confirm and clear focus."""
+        self.name_input.clearFocus()
+
+    def _apply_style(self):
+        """Apply styles."""
+        t = get_theme()
+        # Drag handle style
+        self.drag_handle.setStyleSheet(f"""
+            font-size: 12px;
+            color: {t.text_tertiary};
+            letter-spacing: -2px;
+        """)
+        # Small square dot
+        # Light mode: pure black, Dark mode: softer gray
+        is_dark = get_theme_manager().is_dark
+        dot_color = "#6B7280" if is_dark else t.text_primary  # Gray-500 for dark mode
+        self.dot_label.setStyleSheet(f"""
+            background-color: {dot_color};
+            border-radius: 2px;
+        """)
+        # Frame style
+        self.setStyleSheet(f"""
+            EditableGroupItem {{
+                background-color: transparent;
+                border-radius: 6px;
+            }}
+            EditableGroupItem:hover {{
+                background-color: {t.bg_hover};
+            }}
+        """)
+        # Seamless text input - no shift on focus
+        self.name_input.setStyleSheet(f"""
+            QLineEdit {{
+                background-color: transparent;
+                border: 1px solid transparent;
+                border-radius: 4px;
+                font-size: 13px;
+                color: {t.text_primary};
+                padding: 4px 6px;
+                margin: 0;
+            }}
+            QLineEdit:focus {{
+                border: 1px solid {t.border};
+                background-color: {t.bg_primary};
+            }}
+        """)
+        # Delete button
+        self.delete_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: transparent;
+                border: none;
+                border-radius: 4px;
+                font-size: 14px;
+                font-weight: 500;
+                color: {t.text_tertiary};
+            }}
+            QPushButton:hover {{
+                background-color: {t.text_primary};
+                color: {t.bg_primary};
+            }}
+        """)
+
+    def mousePressEvent(self, event):
+        """Start drag on handle area."""
+        if event.button() == Qt.MouseButton.LeftButton:
+            # Check if click is in drag handle area
+            handle_rect = self.drag_handle.geometry()
+            if handle_rect.contains(event.pos()):
+                self._drag_start_pos = event.pos()
+                self.drag_handle.setCursor(Qt.CursorShape.ClosedHandCursor)
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
-        if self.drag_start_pos is not None and event.buttons() & Qt.MouseButton.LeftButton:
-            distance = (event.pos() - self.drag_start_pos).manhattanLength()
-            if distance >= 10:  # Minimum drag distance
-                # Start drag operation using QListWidget's startDrag
-                self.list_widget.setCurrentItem(self.list_item)
-                drag = QDrag(self.list_widget)
-                mime_data = QMimeData()
-                row = self.list_widget.row(self.list_item)
-                mime_data.setData("application/x-qabstractitemmodeldatalist", b"")
-                mime_data.setText(str(row))
-                drag.setMimeData(mime_data)
-                drag.exec(Qt.DropAction.MoveAction)
-                self.drag_start_pos = None
+        """Handle drag movement."""
+        if self._drag_start_pos is not None:
+            distance = (event.pos() - self._drag_start_pos).manhattanLength()
+            if distance > 10:  # Minimum drag distance
+                self._start_drag()
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event):
-        self.drag_start_pos = None
+        """End drag."""
+        self._drag_start_pos = None
+        self.drag_handle.setCursor(Qt.CursorShape.OpenHandCursor)
         super().mouseReleaseEvent(event)
 
+    def _start_drag(self):
+        """Initiate drag operation."""
+        from PyQt6.QtGui import QDrag, QPixmap, QPainter
+        from PyQt6.QtCore import QMimeData
 
-class MainWindow(QMainWindow):
-    """
-    Main application window with refactored architecture.
+        self._is_dragging = True
+        self.drag_started.emit(self)
 
-    Uses dependency injection for services to enable testing and modularity.
-    """
+        drag = QDrag(self)
+        mime_data = QMimeData()
+        mime_data.setText(self.group.name)
+        drag.setMimeData(mime_data)
 
-    def __init__(
-        self,
-        data_service: Optional[DataService] = None,
-        backup_service: Optional[BackupService] = None,
-    ):
-        super().__init__()
+        # Create semi-transparent pixmap of this widget
+        pixmap = QPixmap(self.size())
+        pixmap.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(pixmap)
+        painter.setOpacity(0.7)
+        self.render(painter)
+        painter.end()
+        drag.setPixmap(pixmap)
+        drag.setHotSpot(self._drag_start_pos)
 
-        # Initialize services
-        self.data_service = data_service or DataService()
-        self.backup_service = backup_service or BackupService()
-        self.totp_service = get_totp_service()
-        self.import_service = ImportService()
+        # Make source widget semi-transparent during drag
+        self.setGraphicsEffect(self._create_opacity_effect(0.3))
 
-        # Load application state
-        self.state = self.data_service.load()
+        drag.exec(Qt.DropAction.MoveAction)
+        self._is_dragging = False
+        self._drag_start_pos = None
+        self.setGraphicsEffect(None)
+        self._apply_style()
 
-        # Initialize state-dependent services
-        self.account_service = AccountService(self.state)
-        self.group_service = GroupService(self.state)
+    def _create_opacity_effect(self, opacity: float):
+        """Create an opacity graphics effect."""
+        from PyQt6.QtWidgets import QGraphicsOpacityEffect
+        effect = QGraphicsOpacityEffect(self)
+        effect.setOpacity(opacity)
+        return effect
 
-        # UI components
-        self.toast = ToastNotification()
+    def dragEnterEvent(self, event):
+        """Accept drag if it's from another EditableGroupItem."""
+        if event.mimeData().hasText() and not self._is_dragging:
+            event.acceptProposedAction()
+            self._update_drop_indicator(event.position().y())
 
-        # UI state
-        self.selected_rows: set[int] = set()
-        self.show_full_info = False
-        self.sidebar_collapsed = False
-        self.group_dialog = None
-        self.deleted_group_backup = None  # For undo: {'group': Group, 'index': int, 'affected_accounts': list}
-        self.undo_toast = None
+    def dragMoveEvent(self, event):
+        """Update drop indicator position during drag."""
+        if event.mimeData().hasText() and not self._is_dragging:
+            event.acceptProposedAction()
+            self._update_drop_indicator(event.position().y())
 
-        # Build UI
+    def _update_drop_indicator(self, y_pos: float):
+        """Show drop indicator line at top or bottom based on mouse position."""
+        is_dark = get_theme_manager().is_dark
+        is_top_half = y_pos < self.height() / 2
+        self._drop_at_top = is_top_half
+
+        # Simple dark gray horizontal line
+        indicator_color = "#6B7280" if is_dark else "#374151"
+
+        if is_top_half:
+            # Show line at top
+            self.setStyleSheet(f"""
+                EditableGroupItem {{
+                    background-color: transparent;
+                    border-top: 2px solid {indicator_color};
+                }}
+            """)
+        else:
+            # Show line at bottom
+            self.setStyleSheet(f"""
+                EditableGroupItem {{
+                    background-color: transparent;
+                    border-bottom: 2px solid {indicator_color};
+                }}
+            """)
+
+    def dragLeaveEvent(self, event):
+        """Reset style when drag leaves."""
+        self._apply_style()
+
+    def dropEvent(self, event):
+        """Handle drop."""
+        source_name = event.mimeData().text()
+        if source_name != self.group.name:
+            # Find source widget and emit signal
+            parent = self.parent()
+            if parent:
+                for child in parent.children():
+                    if isinstance(child, EditableGroupItem) and child.group.name == source_name:
+                        # Pass drop position info
+                        self._drop_at_top = event.position().y() < self.height() / 2
+                        self.dropped.emit(child, self)
+                        break
+        self._apply_style()
+        event.acceptProposedAction()
+
+
+class AddGroupButton(QFrame):
+    """Button to add a new group with custom dotted border."""
+
+    clicked = pyqtSignal()
+
+    def __init__(self, language: str = 'zh', parent=None):
+        super().__init__(parent)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setFixedHeight(36)
+        self._hovered = False
+        self.setMouseTracking(True)
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(12, 0, 12, 0)
+        layout.setSpacing(8)
+
+        # Plus icon
+        self.plus_label = QLabel("+")
+        self.plus_label.setObjectName("addGroupPlus")
+        layout.addWidget(self.plus_label)
+
+        # Text
+        text = "添加分组" if language == 'zh' else "Add Group"
+        self.text_label = QLabel(text)
+        self.text_label.setObjectName("addGroupText")
+        layout.addWidget(self.text_label)
+
+        layout.addStretch()
+
+        self._apply_style()
+
+    def _apply_style(self):
+        """Apply styles."""
+        t = get_theme()
+        # No border in CSS - we draw it manually
+        self.setStyleSheet(f"""
+            AddGroupButton {{
+                background-color: transparent;
+                border: none;
+            }}
+            #addGroupPlus {{
+                font-size: 16px;
+                font-weight: bold;
+                color: {t.text_tertiary};
+                background: transparent;
+            }}
+            #addGroupText {{
+                font-size: 13px;
+                color: {t.text_tertiary};
+                background: transparent;
+            }}
+        """)
+
+    def paintEvent(self, event):
+        """Custom paint for dotted border."""
+        from PyQt6.QtGui import QPainter, QPen, QColor
+        super().paintEvent(event)
+
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+        t = get_theme()
+        border_color = QColor(t.text_tertiary if self._hovered else t.border)
+
+        # Draw background on hover
+        if self._hovered:
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor(t.bg_hover))
+            painter.drawRoundedRect(self.rect().adjusted(1, 1, -1, -1), 6, 6)
+
+        # Draw dotted border with consistent dots
+        pen = QPen(border_color)
+        pen.setWidth(2)
+        pen.setStyle(Qt.PenStyle.DotLine)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        painter.setPen(pen)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawRoundedRect(self.rect().adjusted(1, 1, -1, -1), 6, 6)
+
+        painter.end()
+
+    def enterEvent(self, event):
+        self._hovered = True
+        self.update()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        self._hovered = False
+        self.update()
+        super().leaveEvent(event)
+
+    def mousePressEvent(self, event):
+        """Handle click."""
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit()
+        super().mousePressEvent(event)
+
+
+class ArchiveDialog(QDialog):
+    """Dialog for viewing and restoring archives."""
+
+    def __init__(self, parent=None, language='zh'):
+        super().__init__(parent)
+        self.language = language
+        self.archive_service = get_archive_service()
+        self.selected_archive: Optional[ArchiveInfo] = None
+
+        self._init_ui()
+        self._apply_theme()
+        self._load_archives()
+
+    def _init_ui(self):
+        """Initialize the dialog UI."""
+        self.setWindowTitle("存档历史" if self.language == 'zh' else "Archive History")
+        self.setMinimumSize(500, 400)
+        self.setModal(True)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setSpacing(16)
+
+        # Title
+        title = QLabel("存档历史" if self.language == 'zh' else "Archive History")
+        title.setObjectName("dialogTitle")
+        layout.addWidget(title)
+
+        # Archive list
+        self.archive_list = QListWidget()
+        self.archive_list.setObjectName("archiveList")
+        self.archive_list.itemClicked.connect(self._on_archive_selected)
+        self.archive_list.itemDoubleClicked.connect(self._restore_selected)
+        layout.addWidget(self.archive_list, 1)
+
+        # Buttons
+        btn_layout = QHBoxLayout()
+        btn_layout.setSpacing(12)
+        btn_layout.addStretch()
+
+        self.btn_restore = QPushButton("恢复所选" if self.language == 'zh' else "Restore")
+        self.btn_restore.setObjectName("primaryBtn")
+        self.btn_restore.setEnabled(False)
+        self.btn_restore.clicked.connect(self._restore_selected)
+        btn_layout.addWidget(self.btn_restore)
+
+        self.btn_delete = QPushButton("删除" if self.language == 'zh' else "Delete")
+        self.btn_delete.setObjectName("dangerBtn")
+        self.btn_delete.setEnabled(False)
+        self.btn_delete.clicked.connect(self._delete_selected)
+        btn_layout.addWidget(self.btn_delete)
+
+        layout.addLayout(btn_layout)
+
+    def _apply_theme(self):
+        """Apply current theme to dialog."""
+        t = get_theme()
+        self.setStyleSheet(f"""
+            QDialog {{
+                background-color: {t.bg_primary};
+            }}
+            #dialogTitle {{
+                font-size: 18px;
+                font-weight: 600;
+                color: {t.text_primary};
+            }}
+            #archiveList {{
+                background-color: {t.bg_secondary};
+                border: 1px solid {t.border};
+                border-radius: 8px;
+                padding: 8px;
+            }}
+            #archiveList::item {{
+                padding: 12px;
+                border-radius: 6px;
+                margin: 2px 0;
+                color: {t.text_primary};
+            }}
+            #archiveList::item:hover {{
+                background-color: {t.bg_hover};
+            }}
+            #archiveList::item:selected {{
+                background-color: {t.bg_selected};
+            }}
+            #primaryBtn {{
+                background-color: {t.accent};
+                border: none;
+                border-radius: 6px;
+                padding: 10px 20px;
+                color: white;
+                font-weight: 500;
+            }}
+            #primaryBtn:hover {{
+                background-color: {t.accent};
+                opacity: 0.9;
+            }}
+            #primaryBtn:disabled {{
+                background-color: {t.bg_tertiary};
+                color: {t.text_tertiary};
+            }}
+            #dangerBtn {{
+                background-color: transparent;
+                border: 1px solid {t.error};
+                border-radius: 6px;
+                padding: 10px 20px;
+                color: {t.error};
+                font-weight: 500;
+            }}
+            #dangerBtn:hover {{
+                background-color: {t.error};
+                color: white;
+            }}
+            #dangerBtn:disabled {{
+                border-color: {t.text_tertiary};
+                color: {t.text_tertiary};
+            }}
+        """)
+
+    def _load_archives(self):
+        """Load archives into the list."""
+        self.archive_list.clear()
+        archives = self.archive_service.list_archives()
+
+        for archive in archives:
+            item = QListWidgetItem()
+            item.setData(Qt.ItemDataRole.UserRole, archive)
+            text = f"{archive.display_time}\n{archive.account_count} 账户 · {archive.group_count} 分组"
+            item.setText(text)
+            self.archive_list.addItem(item)
+
+        if not archives:
+            item = QListWidgetItem("暂无存档" if self.language == 'zh' else "No archives")
+            item.setFlags(Qt.ItemFlag.NoItemFlags)
+            self.archive_list.addItem(item)
+
+    def _on_archive_selected(self, item: QListWidgetItem):
+        """Handle archive selection."""
+        self.selected_archive = item.data(Qt.ItemDataRole.UserRole)
+        self.btn_restore.setEnabled(self.selected_archive is not None)
+        self.btn_delete.setEnabled(self.selected_archive is not None)
+
+    def _restore_selected(self):
+        """Restore the selected archive."""
+        if not self.selected_archive:
+            return
+
+        msg = "确定要恢复到此存档吗？当前数据将被替换。" if self.language == 'zh' else "Restore to this archive? Current data will be replaced."
+        reply = QMessageBox.question(self, "确认" if self.language == 'zh' else "Confirm", msg)
+
+        if reply == QMessageBox.StandardButton.Yes:
+            self.accept()
+
+    def _delete_selected(self):
+        """Delete the selected archive."""
+        if not self.selected_archive:
+            return
+
+        msg = "确定要删除此存档吗？" if self.language == 'zh' else "Delete this archive?"
+        reply = QMessageBox.question(self, "确认" if self.language == 'zh' else "Confirm", msg)
+
+        if reply == QMessageBox.StandardButton.Yes:
+            self.archive_service.delete_archive(self.selected_archive)
+            self._load_archives()
+            self.selected_archive = None
+            self.btn_restore.setEnabled(False)
+            self.btn_delete.setEnabled(False)
+
+    def get_selected_archive(self) -> Optional[ArchiveInfo]:
+        """Get the selected archive for restoration."""
+        return self.selected_archive
+
+
+class TrashItemWidget(QFrame):
+    """Custom widget for trash list item with checkbox."""
+
+    checked_changed = None  # Will be set by dialog
+
+    def __init__(self, account: Account, language: str = 'zh', parent=None):
+        super().__init__(parent)
+        self.account = account
+        self.language = language
+        self._checked = False
         self._init_ui()
 
-        # Auto-refresh timer
-        self.timer = QTimer()
-        self.timer.timeout.connect(self._update_display)
-        self.timer.start(Settings.TIMER_INTERVAL)
+    def _init_ui(self):
+        zh = self.language == 'zh'
+        t = get_theme()
 
-        logger.info("MainWindow initialized")
+        self.setObjectName("trashItemWidget")
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
 
-    def tr(self, key: str) -> str:
-        """Get translated text for current language."""
-        return get_translation(key, self.state.language)
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(10, 8, 12, 8)
+        layout.setSpacing(10)
+
+        # Checkbox icon (clickable label)
+        self.checkbox_label = QLabel()
+        self.checkbox_label.setFixedSize(22, 22)
+        self._update_checkbox_icon()
+        layout.addWidget(self.checkbox_label)
+
+        # Email icon
+        icon_label = QLabel()
+        icon_label.setPixmap(icon_mail(18, t.text_secondary))
+        icon_label.setFixedSize(20, 20)
+        layout.addWidget(icon_label)
+
+        # Info container
+        info_layout = QVBoxLayout()
+        info_layout.setSpacing(1)
+        info_layout.setContentsMargins(0, 0, 0, 0)
+
+        # Email
+        email_label = QLabel(self.account.email)
+        email_label.setObjectName("emailLabel")
+        info_layout.addWidget(email_label)
+
+        # Groups
+        groups = ", ".join(self.account.groups) if self.account.groups else ("无分组" if zh else "No group")
+        meta_label = QLabel(groups)
+        meta_label.setObjectName("metaLabel")
+        info_layout.addWidget(meta_label)
+
+        layout.addLayout(info_layout, 1)
+
+    def _update_checkbox_icon(self):
+        t = get_theme()
+        if self._checked:
+            self.checkbox_label.setPixmap(icon_checkbox(20, t.success))
+        else:
+            self.checkbox_label.setPixmap(icon_checkbox_empty(20, t.text_tertiary))
+
+    def is_checked(self) -> bool:
+        return self._checked
+
+    def set_checked(self, checked: bool):
+        self._checked = checked
+        self._update_checkbox_icon()
+
+    def toggle_checked(self):
+        self._checked = not self._checked
+        self._update_checkbox_icon()
+        if self.checked_changed:
+            self.checked_changed()
+
+
+class TrashDialog(QDialog):
+    """Dialog for viewing and restoring deleted accounts from trash."""
+
+    def __init__(self, parent=None, state=None, language='zh'):
+        super().__init__(parent)
+        self.language = language
+        self.state = state
+        self.selected_accounts: list[Account] = []
+        self._changed = False
+        self._item_widgets: dict[Account, TrashItemWidget] = {}
+
+        self._init_ui()
+        self._apply_theme()
+        self._load_trash()
+
+    def _init_ui(self):
+        """Initialize the dialog UI."""
+        zh = self.language == 'zh'
+        self.setWindowTitle("回收站" if zh else "Trash")
+        self.setMinimumSize(520, 480)
+        self.setModal(True)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(24, 24, 24, 24)
+        layout.setSpacing(16)
+
+        # Header with icon and title
+        header_layout = QHBoxLayout()
+        header_layout.setSpacing(10)
+
+        header_icon = QLabel()
+        t = get_theme()
+        header_icon.setPixmap(icon_trash(24, t.text_secondary))
+        header_layout.addWidget(header_icon)
+
+        title = QLabel("回收站" if zh else "Trash")
+        title.setObjectName("dialogTitle")
+        header_layout.addWidget(title)
+
+        header_layout.addStretch()
+
+        # Trash count badge
+        self.count_badge = QLabel()
+        self.count_badge.setObjectName("countBadge")
+        header_layout.addWidget(self.count_badge)
+
+        layout.addLayout(header_layout)
+
+        # Selection info row
+        select_row = QHBoxLayout()
+        select_row.setSpacing(8)
+
+        self.select_info = QLabel()
+        self.select_info.setObjectName("selectInfo")
+        select_row.addWidget(self.select_info)
+
+        select_row.addStretch()
+
+        # Select all / Deselect all
+        self.btn_select_all = QPushButton("全选" if zh else "Select All")
+        self.btn_select_all.setObjectName("linkBtn")
+        self.btn_select_all.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_select_all.clicked.connect(self._select_all)
+        select_row.addWidget(self.btn_select_all)
+
+        self.btn_deselect_all = QPushButton("取消全选" if zh else "Deselect")
+        self.btn_deselect_all.setObjectName("linkBtn")
+        self.btn_deselect_all.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_deselect_all.clicked.connect(self._deselect_all)
+        select_row.addWidget(self.btn_deselect_all)
+
+        layout.addLayout(select_row)
+
+        # Empty state container
+        self.empty_container = QFrame()
+        self.empty_container.setObjectName("emptyContainer")
+        empty_layout = QVBoxLayout(self.empty_container)
+        empty_layout.setContentsMargins(40, 60, 40, 60)
+        empty_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        empty_icon = QLabel()
+        empty_icon.setPixmap(icon_trash(64, t.text_tertiary))
+        empty_icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        empty_layout.addWidget(empty_icon)
+
+        empty_title = QLabel("回收站为空" if zh else "Trash is Empty")
+        empty_title.setObjectName("emptyTitle")
+        empty_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        empty_layout.addWidget(empty_title)
+
+        empty_desc = QLabel("删除的账户会显示在这里" if zh else "Deleted accounts will appear here")
+        empty_desc.setObjectName("emptyDesc")
+        empty_desc.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        empty_layout.addWidget(empty_desc)
+
+        self.empty_container.hide()
+        layout.addWidget(self.empty_container, 1)
+
+        # Trash list
+        self.trash_list = QListWidget()
+        self.trash_list.setObjectName("trashList")
+        self.trash_list.itemClicked.connect(self._on_item_clicked)
+        self.trash_list.setSelectionMode(QListWidget.SelectionMode.NoSelection)
+        self.trash_list.setVerticalScrollMode(QListWidget.ScrollMode.ScrollPerPixel)
+        layout.addWidget(self.trash_list, 1)
+
+        # Buttons row
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(10)
+
+        self.btn_clear_all = QPushButton("清空回收站" if zh else "Empty Trash")
+        self.btn_clear_all.setObjectName("dangerGlassBtn")
+        self.btn_clear_all.setIcon(QIcon(icon_trash(14, t.error)))
+        self.btn_clear_all.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_clear_all.clicked.connect(self._clear_all)
+        btn_row.addWidget(self.btn_clear_all)
+
+        btn_row.addStretch()
+
+        self.btn_restore = QPushButton("恢复所选" if zh else "Restore Selected")
+        self.btn_restore.setObjectName("primaryBtn")
+        self.btn_restore.setIcon(QIcon(icon_refresh(14, "#FFFFFF")))
+        self.btn_restore.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_restore.setEnabled(False)
+        self.btn_restore.clicked.connect(self._restore_selected)
+        btn_row.addWidget(self.btn_restore)
+
+        self.btn_delete = QPushButton("永久删除" if zh else "Delete Forever")
+        self.btn_delete.setObjectName("dangerBtn")
+        self.btn_delete.setIcon(QIcon(icon_close(14, t.error)))
+        self.btn_delete.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_delete.setEnabled(False)
+        self.btn_delete.clicked.connect(self._delete_selected)
+        btn_row.addWidget(self.btn_delete)
+
+        layout.addLayout(btn_row)
+
+    def _apply_theme(self):
+        """Apply current theme to dialog."""
+        t = get_theme()
+        self.setStyleSheet(f"""
+            QDialog {{
+                background-color: {t.bg_primary};
+            }}
+            #dialogTitle {{
+                font-size: 20px;
+                font-weight: 600;
+                color: {t.text_primary};
+            }}
+            #countBadge {{
+                background-color: rgba(16, 185, 129, 0.15);
+                color: {t.success};
+                padding: 4px 10px;
+                border-radius: 12px;
+                font-size: 12px;
+                font-weight: 500;
+            }}
+            #selectInfo {{
+                font-size: 13px;
+                color: {t.text_secondary};
+            }}
+            #linkBtn {{
+                background: transparent;
+                border: none;
+                color: {t.success};
+                font-size: 13px;
+                font-weight: 500;
+                padding: 4px 8px;
+            }}
+            #linkBtn:hover {{
+                color: #059669;
+            }}
+            #emptyContainer {{
+                background-color: {t.bg_secondary};
+                border: 1px solid {t.border};
+                border-radius: 12px;
+            }}
+            #emptyTitle {{
+                font-size: 16px;
+                font-weight: 600;
+                color: {t.text_secondary};
+                margin-top: 12px;
+            }}
+            #emptyDesc {{
+                font-size: 13px;
+                color: {t.text_tertiary};
+            }}
+            #trashList {{
+                background-color: {t.bg_secondary};
+                border: 1px solid {t.border};
+                border-radius: 12px;
+                padding: 6px;
+                outline: none;
+            }}
+            #trashList::item {{
+                padding: 0px;
+                margin: 2px 0;
+                border-radius: 8px;
+                background-color: transparent;
+            }}
+            #trashList::item:hover {{
+                background-color: {t.bg_hover};
+            }}
+            #trashItemWidget {{
+                background-color: transparent;
+                border-radius: 8px;
+            }}
+            #emailLabel {{
+                font-size: 14px;
+                font-weight: 500;
+                color: {t.text_primary};
+            }}
+            #metaLabel {{
+                font-size: 12px;
+                color: {t.text_tertiary};
+            }}
+            #dangerGlassBtn {{
+                background-color: rgba(239, 68, 68, 0.1);
+                border: 1px solid rgba(239, 68, 68, 0.2);
+                border-radius: 10px;
+                padding: 10px 16px;
+                color: {t.error};
+                font-weight: 500;
+            }}
+            #dangerGlassBtn:hover {{
+                background-color: rgba(239, 68, 68, 0.2);
+            }}
+            #dangerGlassBtn:disabled {{
+                color: {t.text_tertiary};
+                background-color: {t.glass_bg};
+                border-color: {t.glass_border};
+            }}
+            #primaryBtn {{
+                background-color: {t.success};
+                border: none;
+                border-radius: 10px;
+                padding: 10px 20px;
+                color: white;
+                font-weight: 500;
+            }}
+            #primaryBtn:hover {{
+                background-color: #059669;
+            }}
+            #primaryBtn:disabled {{
+                background-color: {t.bg_tertiary};
+                color: {t.text_tertiary};
+            }}
+            #dangerBtn {{
+                background-color: transparent;
+                border: 1px solid {t.error};
+                border-radius: 10px;
+                padding: 10px 20px;
+                color: {t.error};
+                font-weight: 500;
+            }}
+            #dangerBtn:hover {{
+                background-color: {t.error};
+                color: white;
+            }}
+            #dangerBtn:disabled {{
+                border-color: {t.text_tertiary};
+                color: {t.text_tertiary};
+            }}
+        """)
+        # Update button icons with theme colors
+        self.btn_clear_all.setIcon(QIcon(icon_trash(14, t.error)))
+        self.btn_delete.setIcon(QIcon(icon_close(14, t.error)))
+
+    def _load_trash(self):
+        """Load trash items into the list."""
+        self.trash_list.clear()
+        self._item_widgets.clear()
+        self.selected_accounts.clear()
+        zh = self.language == 'zh'
+
+        trash_count = len(self.state.trash) if hasattr(self.state, 'trash') and self.state.trash else 0
+
+        # Update count badge
+        self.count_badge.setText(f"{trash_count} {'项' if zh else 'items'}" if trash_count > 0 else "")
+        self.count_badge.setVisible(trash_count > 0)
+
+        # Update selection info
+        self._update_selection_info()
+
+        if trash_count == 0:
+            self.trash_list.hide()
+            self.empty_container.show()
+            self.btn_clear_all.setEnabled(False)
+            self.btn_select_all.setVisible(False)
+            self.btn_deselect_all.setVisible(False)
+            self.select_info.setVisible(False)
+            return
+
+        self.empty_container.hide()
+        self.trash_list.show()
+        self.btn_clear_all.setEnabled(True)
+        self.btn_select_all.setVisible(True)
+        self.btn_deselect_all.setVisible(True)
+        self.select_info.setVisible(True)
+
+        for account in self.state.trash:
+            item = QListWidgetItem()
+            item.setData(Qt.ItemDataRole.UserRole, account)
+
+            # Create custom widget
+            widget = TrashItemWidget(account, self.language)
+            widget.checked_changed = self._on_selection_changed
+            item.setSizeHint(widget.sizeHint())
+
+            self._item_widgets[account] = widget
+            self.trash_list.addItem(item)
+            self.trash_list.setItemWidget(item, widget)
+
+    def _on_item_clicked(self, item: QListWidgetItem):
+        """Handle item click - toggle checkbox."""
+        account = item.data(Qt.ItemDataRole.UserRole)
+        if account and account in self._item_widgets:
+            widget = self._item_widgets[account]
+            widget.toggle_checked()
+
+    def _on_selection_changed(self):
+        """Update selected accounts list based on checkboxes."""
+        self.selected_accounts = [
+            acc for acc, widget in self._item_widgets.items()
+            if widget.is_checked()
+        ]
+        self._update_selection_info()
+        has_selection = len(self.selected_accounts) > 0
+        self.btn_restore.setEnabled(has_selection)
+        self.btn_delete.setEnabled(has_selection)
+
+    def _update_selection_info(self):
+        """Update the selection info label."""
+        zh = self.language == 'zh'
+        count = len(self.selected_accounts)
+        if count > 0:
+            self.select_info.setText(f"已选 {count} 项" if zh else f"{count} selected")
+        else:
+            self.select_info.setText("点击选择账户" if zh else "Click to select")
+
+    def _select_all(self):
+        """Select all items."""
+        for widget in self._item_widgets.values():
+            widget.set_checked(True)
+        self._on_selection_changed()
+
+    def _deselect_all(self):
+        """Deselect all items."""
+        for widget in self._item_widgets.values():
+            widget.set_checked(False)
+        self._on_selection_changed()
+
+    def _restore_selected(self):
+        """Restore all selected accounts."""
+        if not self.selected_accounts:
+            return
+
+        # Move selected from trash back to accounts
+        for account in self.selected_accounts:
+            if account in self.state.trash:
+                self.state.trash.remove(account)
+                self.state.accounts.append(account)
+
+        self._changed = True
+        self._load_trash()
+
+    def _delete_selected(self):
+        """Permanently delete selected accounts."""
+        if not self.selected_accounts:
+            return
+
+        zh = self.language == 'zh'
+        count = len(self.selected_accounts)
+        msg = f"确定要永久删除 {count} 个账户吗？此操作无法撤销。" if zh else f"Permanently delete {count} account(s)? This cannot be undone."
+        reply = QMessageBox.question(self, "确认" if zh else "Confirm", msg)
+
+        if reply == QMessageBox.StandardButton.Yes:
+            for account in self.selected_accounts:
+                if account in self.state.trash:
+                    self.state.trash.remove(account)
+            self._changed = True
+            self._load_trash()
+
+    def _clear_all(self):
+        """Clear all items from trash."""
+        zh = self.language == 'zh'
+        if not hasattr(self.state, 'trash') or not self.state.trash:
+            return
+
+        msg = f"确定要清空回收站吗？将永久删除 {len(self.state.trash)} 个账户。" if zh else f"Empty trash? {len(self.state.trash)} accounts will be permanently deleted."
+        reply = QMessageBox.question(self, "确认" if zh else "Confirm", msg)
+
+        if reply == QMessageBox.StandardButton.Yes:
+            self.state.trash.clear()
+            self._changed = True
+            self._load_trash()
+
+    def has_changes(self) -> bool:
+        """Check if any changes were made."""
+        return self._changed
+
+    def accept(self):
+        """Accept the dialog."""
+        super().accept()
+
+    def reject(self):
+        """Reject the dialog - still save changes if any."""
+        if self._changed:
+            super().accept()  # Use accept to trigger save
+        else:
+            super().reject()
+
+
+class MainWindowV2(QMainWindow):
+    """Main application window with modern minimal design."""
+
+    def __init__(self):
+        super().__init__()
+
+        # Services
+        self.totp_service = get_totp_service()
+        self.time_service = get_time_service()
+        self.theme_manager = get_theme_manager()
+        self.library_service = LibraryService()
+        self.archive_service = get_archive_service()
+
+        # State
+        self.state = self._load_state()
+        self.selected_account: Optional[Account] = None
+        self.selected_group: Optional[str] = None
+        self.account_widgets: List[QFrame] = []
+        self.group_buttons: List[QWidget] = []
+        self.copied_toast_timer: Optional[QTimer] = None
+        self.codes_visible: bool = True  # Batch show/hide state
+        self.multi_select_mode: bool = False  # Multi-select mode
+        self.selection_manager = SelectionManager()  # Unified selection management
+        self.list_view_mode: bool = False  # False=card view, True=list view
+        self.group_edit_mode: bool = False  # Group editing mode
+        self.detail_edit_mode: bool = False  # Detail panel inline edit mode
+        self.editable_fields: Dict[str, QLineEdit] = {}  # Editable field references
+        self._pending_delete_backup: Optional[dict] = None  # For library delete undo
+        self._menu_close_times: Dict[str, float] = {}  # Track menu close times
+
+        # Setup
+        self._init_window()
+        self._init_ui()
+        self._apply_theme()
+
+        # Load data
+        self._refresh_groups()
+        self._refresh_account_list()
+        if self.state.accounts:
+            self.selected_account = self.state.accounts[0]
+            self._update_detail_panel()
+
+        self._start_timer()
+
+        # Install global event filter to detect clicks outside group edit area
+        from PyQt6.QtWidgets import QApplication
+        QApplication.instance().installEventFilter(self)
+
+        logger.info("MainWindowV2 initialized")
+
+    def eventFilter(self, obj, event) -> bool:
+        """Handle events for click-outside detection."""
+        from PyQt6.QtCore import QEvent
+        from PyQt6.QtWidgets import QLineEdit
+
+        # Track library panel hide event
+        if obj == self.library_panel and event.type() == QEvent.Type.Hide:
+            self._menu_close_times["library_panel"] = time.time()
+
+        # Handle click outside library panel to close it (since it's now a Tool window)
+        if event.type() == QEvent.Type.MouseButtonPress and hasattr(self, 'library_panel') and self.library_panel.isVisible():
+            click_pos = event.globalPosition().toPoint()
+            panel_rect = self.library_panel.geometry()
+
+            # Check if click is inside the panel
+            if not panel_rect.contains(click_pos):
+                # Also check if clicking on the library button itself
+                if hasattr(self, 'library_btn'):
+                    lib_btn_rect = self.library_btn.rect()
+                    lib_btn_global = self.library_btn.mapToGlobal(lib_btn_rect.topLeft())
+                    lib_btn_rect.moveTopLeft(lib_btn_global)
+                    if lib_btn_rect.contains(click_pos):
+                        return super().eventFilter(obj, event)
+
+                # Click outside panel and button - close panel
+                self.library_panel.hide()
+                self._editing_library_id = None
+
+        # Notes edit event handling (check both widget and viewport)
+        if hasattr(self, 'notes_edit'):
+            is_notes_widget = obj == self.notes_edit or obj == self.notes_edit.viewport()
+            if is_notes_widget and event.type() == QEvent.Type.MouseButtonPress:
+                # Schedule the click handler to run after event processing
+                QTimer.singleShot(10, self._handle_notes_click)
+            elif obj == self.notes_edit and event.type() == QEvent.Type.FocusOut:
+                self._handle_notes_focus_out()
+
+        # Table notes inline edit - detect click outside
+        if event.type() == QEvent.Type.MouseButtonPress:
+            if hasattr(self, '_table_notes_editing') and self._table_notes_editing:
+                if hasattr(self, '_table_notes_edit') and self._table_notes_edit:
+                    # Check if click is outside the edit widget
+                    if obj != self._table_notes_edit:
+                        QTimer.singleShot(0, self._finish_table_notes_edit)
+
+        if event.type() == QEvent.Type.MouseButtonPress and self.group_edit_mode:
+            # Get the widget that was clicked
+            click_pos = event.globalPosition().toPoint()
+
+            # Check if click is within groups_scroll area
+            groups_rect = self.groups_scroll.rect()
+            groups_global = self.groups_scroll.mapToGlobal(groups_rect.topLeft())
+            groups_rect.moveTopLeft(groups_global)
+
+            # Check if click is within edit button
+            edit_btn_rect = self.btn_edit_groups.rect()
+            edit_btn_global = self.btn_edit_groups.mapToGlobal(edit_btn_rect.topLeft())
+            edit_btn_rect.moveTopLeft(edit_btn_global)
+
+            # Check if currently focused widget is a QLineEdit in groups area (editing group name)
+            focused = self.focusWidget()
+            is_editing_name = isinstance(focused, QLineEdit) and self.groups_scroll.isAncestorOf(focused)
+
+            if not groups_rect.contains(click_pos) and not edit_btn_rect.contains(click_pos):
+                if not is_editing_name:
+                    # Click is outside and not editing - exit edit mode
+                    self.group_edit_mode = False
+                    zh = self.state.language == 'zh'
+                    self.btn_edit_groups.setText("编辑" if zh else "Edit")
+                    self._save_data()
+                    self._refresh_groups()
+
+        return super().eventFilter(obj, event)
+
+    def _load_state(self) -> AppState:
+        """Load application state from current library."""
+        self.library_service.initialize()
+        current_library = self.library_service.get_current_library()
+        state = self.library_service.load_library_state(current_library)
+        logger.info(f"Loaded library: {current_library.name} ({len(state.accounts)} accounts)")
+        return state
+
+    def _init_window(self) -> None:
+        """Initialize window properties."""
+        self.setWindowTitle("G-Account Manager")
+        self.setMinimumSize(1000, 650)
+        self.resize(1200, 750)
 
     def _init_ui(self) -> None:
-        """Initialize the user interface - Notion style."""
-        self.setWindowTitle(self.tr('window_title'))
-        self.resize(Settings.DEFAULT_WINDOW_WIDTH, Settings.DEFAULT_WINDOW_HEIGHT)
-        self.setMinimumSize(Settings.MIN_WINDOW_WIDTH, Settings.MIN_WINDOW_HEIGHT)
+        """Initialize the user interface."""
+        central = QWidget()
+        self.setCentralWidget(central)
 
-        # Set Notion-style background
-        self.setStyleSheet("QMainWindow { background-color: #FFFFFF; }")
+        main_layout = QHBoxLayout(central)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+        main_layout.setSpacing(0)
 
-        # Main widget
+        # Sidebar
+        self._create_sidebar(main_layout)
+
+        # Main content
+        self._create_main_content(main_layout)
+
+        # Toast
+        self.toast = ToastWidget(central)
+
+    def _create_sidebar(self, layout: QHBoxLayout) -> None:
+        """Create sidebar with library selector, groups, and archive entry."""
+        self.sidebar = QFrame()
+        self.sidebar.setObjectName("sidebar")
+        self.sidebar.setFixedWidth(220)
+
+        sidebar_layout = QVBoxLayout(self.sidebar)
+        sidebar_layout.setContentsMargins(0, 0, 0, 0)
+        sidebar_layout.setSpacing(0)
+
+        # Library selector (top)
+        library_container = QWidget()
+        library_container_layout = QVBoxLayout(library_container)
+        library_container_layout.setContentsMargins(0, 0, 0, 0)
+        library_container_layout.setSpacing(0)
+
+        library_frame = QFrame()
+        library_frame.setObjectName("libraryFrame")
+        library_frame.setFixedHeight(56)  # Match header height
+        library_layout = QHBoxLayout(library_frame)
+        library_layout.setContentsMargins(12, 8, 12, 8)
+        library_layout.setSpacing(0)
+
+        self.btn_library = QPushButton()
+        self.btn_library.setObjectName("libraryBtn")
+        self.btn_library.setFixedHeight(36)
+        self.btn_library.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_library.clicked.connect(self._toggle_library_panel)
+        library_layout.addWidget(self.btn_library)
+
+        library_container_layout.addWidget(library_frame)
+        sidebar_layout.addWidget(library_container)
+
+        # Floating library panel (dropdown style - fully transparent, no shadow)
+        self.library_panel = QFrame(self)
+        self.library_panel.setObjectName("libraryPanel")
+        self.library_panel.setVisible(False)
+        # Use Tool window type instead of Popup to allow proper input method switching
+        self.library_panel.setWindowFlags(Qt.WindowType.Tool | Qt.WindowType.FramelessWindowHint | Qt.WindowType.NoDropShadowWindowHint)
+        self.library_panel.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.library_panel.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, False)  # Allow activation for input method
+        self.library_panel.setStyleSheet("QFrame#libraryPanel { background: transparent; border: none; }")
+        self.library_panel.installEventFilter(self)  # Track hide events
+        self.library_panel_layout = QVBoxLayout(self.library_panel)
+        self.library_panel_layout.setContentsMargins(0, 4, 0, 4)
+        self.library_panel_layout.setSpacing(2)
+
+        # Groups header with title and edit button
+        groups_header = QFrame()
+        groups_header.setObjectName("groupsHeader")
+        groups_header_layout = QHBoxLayout(groups_header)
+        groups_header_layout.setContentsMargins(12, 8, 8, 4)
+        groups_header_layout.setSpacing(0)
+
+        zh = self.state.language == 'zh'
+        groups_title = QLabel("分组" if zh else "Groups")
+        groups_title.setObjectName("groupsTitle")
+        groups_header_layout.addWidget(groups_title)
+
+        groups_header_layout.addStretch()
+
+        self.btn_edit_groups = QPushButton("编辑" if zh else "Edit")
+        self.btn_edit_groups.setObjectName("editGroupsBtn")
+        self.btn_edit_groups.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_edit_groups.clicked.connect(self._toggle_group_edit_mode)
+        groups_header_layout.addWidget(self.btn_edit_groups)
+
+        sidebar_layout.addWidget(groups_header)
+
+        # Groups navigation
+        self.groups_scroll = QScrollArea()
+        self.groups_scroll.setObjectName("groupsScroll")
+        self.groups_scroll.setWidgetResizable(True)
+        self.groups_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+
+        self.groups_widget = QWidget()
+        self.groups_layout = QVBoxLayout(self.groups_widget)
+        self.groups_layout.setContentsMargins(8, 8, 8, 8)
+        self.groups_layout.setSpacing(2)
+        self.groups_layout.addStretch()
+
+        self.groups_scroll.setWidget(self.groups_widget)
+        sidebar_layout.addWidget(self.groups_scroll, 1)
+
+        # Bottom section (trash + archive + import + add account)
+        bottom_frame = QFrame()
+        bottom_frame.setObjectName("bottomFrame")
+        bottom_layout = QVBoxLayout(bottom_frame)
+        bottom_layout.setContentsMargins(12, 12, 12, 12)
+        bottom_layout.setSpacing(8)
+
+        # Import button
+        self.btn_import = QPushButton()
+        self.btn_import.setObjectName("importBtn")
+        self.btn_import.setFixedHeight(36)
+        self.btn_import.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_import.clicked.connect(self._show_import_dialog)
+        bottom_layout.addWidget(self.btn_import)
+
+        # Add account button
+        self.btn_add_account = QPushButton()
+        self.btn_add_account.setObjectName("addAccountBtn")
+        self.btn_add_account.setFixedHeight(36)
+        self.btn_add_account.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_add_account.clicked.connect(self._show_add_account)
+        bottom_layout.addWidget(self.btn_add_account)
+
+        sidebar_layout.addWidget(bottom_frame)
+
+        layout.addWidget(self.sidebar)
+
+    def _create_main_content(self, layout: QHBoxLayout) -> None:
+        """Create main content area."""
         main_widget = QWidget()
-        main_widget.setStyleSheet("background-color: #FFFFFF;")
-        self.setCentralWidget(main_widget)
-        main_layout = QVBoxLayout()
-        main_layout.setContentsMargins(20, 20, 20, 20)
-        main_layout.setSpacing(16)
-        main_widget.setLayout(main_layout)
+        main_layout = QVBoxLayout(main_widget)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+        main_layout.setSpacing(0)
 
         # Header
         self._create_header(main_layout)
 
-        # Import section
-        self._create_import_section(main_layout)
+        # Content area (account list + detail)
+        content = QWidget()
+        content_layout = QHBoxLayout(content)
+        content_layout.setContentsMargins(0, 0, 0, 0)
+        content_layout.setSpacing(0)
 
-        # Content splitter (sidebar + table)
-        self._create_content_area(main_layout)
+        self._create_account_list(content_layout)
+        self._create_detail_panel(content_layout)
 
-        # Initialize data
-        self._refresh_group_list()
-        self._load_accounts_to_table()
-        self._update_display()
+        main_layout.addWidget(content, 1)
+        layout.addWidget(main_widget, 1)
 
     def _create_header(self, layout: QVBoxLayout) -> None:
-        """Create the header with title and language button (Notion style)."""
-        header_container = QWidget()
-        header_layout = QHBoxLayout(header_container)
-        header_layout.setContentsMargins(0, 0, 0, 10)
+        """Create header with search and tools."""
+        header = QFrame()
+        header.setObjectName("header")
+        header.setFixedHeight(56)
 
-        # Simple title - Notion style
-        self.title_label = QLabel(self.tr('window_title'))
-        self.title_label.setFont(QFont("Microsoft YaHei UI", 20, QFont.Weight.DemiBold))
-        self.title_label.setStyleSheet("color: #37352F;")
-        header_layout.addWidget(self.title_label)
+        header_layout = QHBoxLayout(header)
+        header_layout.setContentsMargins(16, 0, 16, 0)
+        header_layout.setSpacing(12)
+
+        # Search bar - expand to fill available space
+        search_container = QFrame()
+        search_container.setObjectName("searchContainer")
+        search_layout = QHBoxLayout(search_container)
+        search_layout.setContentsMargins(12, 0, 12, 0)
+        search_layout.setSpacing(8)
+
+        self.search_icon = QLabel()
+        search_layout.addWidget(self.search_icon)
+
+        self.search_input = QLineEdit()
+        self.search_input.setObjectName("searchInput")
+        self.search_input.textChanged.connect(self._on_search_changed)
+        search_layout.addWidget(self.search_input)
+
+        header_layout.addWidget(search_container, 1)  # stretch factor 1 to fill space
+
+        # Toggle codes visibility button
+        self.btn_toggle_codes = QPushButton()
+        self.btn_toggle_codes.setObjectName("toolBtn")
+        self.btn_toggle_codes.setFixedSize(36, 36)
+        self.btn_toggle_codes.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_toggle_codes.clicked.connect(self._toggle_codes_visibility)
+        header_layout.addWidget(self.btn_toggle_codes)
+
+        # Tools
+        self.btn_theme = QPushButton()
+        self.btn_theme.setObjectName("toolBtn")
+        self.btn_theme.setFixedSize(36, 36)
+        self.btn_theme.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_theme.clicked.connect(self._toggle_theme)
+        header_layout.addWidget(self.btn_theme)
+
+        self.btn_language = QPushButton()
+        self.btn_language.setObjectName("toolBtn")
+        self.btn_language.setFixedSize(36, 36)
+        self.btn_language.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_language.clicked.connect(self._toggle_language)
+        header_layout.addWidget(self.btn_language)
+
+        self.btn_settings = QPushButton()
+        self.btn_settings.setObjectName("toolBtn")
+        self.btn_settings.setFixedSize(36, 36)
+        self.btn_settings.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_settings.clicked.connect(self._show_settings_menu)
+        header_layout.addWidget(self.btn_settings)
+
+        layout.addWidget(header)
+
+    def _create_account_list(self, layout: QHBoxLayout) -> None:
+        """Create account list panel."""
+        self.list_panel = QFrame()
+        self.list_panel.setObjectName("accountListPanel")
+        self.list_panel.setFixedWidth(320)
+        self.list_panel.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
+        self.list_panel.mousePressEvent = self._on_detail_panel_click
+
+        list_layout = QVBoxLayout(self.list_panel)
+        list_layout.setContentsMargins(0, 0, 0, 0)
+        list_layout.setSpacing(0)
+
+        # Header with title and action buttons
+        list_header = QFrame()
+        list_header.setObjectName("listHeader")
+        list_header.setFixedHeight(44)
+        header_layout = QHBoxLayout(list_header)
+        header_layout.setContentsMargins(12, 0, 8, 0)
+        header_layout.setSpacing(4)
+
+        self.list_title = QLabel()
+        self.list_title.setObjectName("listTitle")
+        header_layout.addWidget(self.list_title)
 
         header_layout.addStretch()
 
-        # Language button - minimal style
-        self.btn_language = QPushButton()
-        self.btn_language.setFixedSize(80, 28)
-        self.btn_language.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_language.setFont(QFont("Microsoft YaHei UI", 10))
-        self.btn_language.setStyleSheet("""
-            QPushButton {
-                background-color: transparent;
-                border: 1px solid #E9E9E7;
-                border-radius: 4px;
-                padding: 0 10px;
-                color: #787774;
-            }
-            QPushButton:hover {
-                background-color: #F7F6F3;
-            }
-        """)
-        self.btn_language.clicked.connect(self._switch_language)
-        self._update_language_button()
-        header_layout.addWidget(self.btn_language)
+        # Multi-select toggle button
+        self.btn_multi_select = QPushButton()
+        self.btn_multi_select.setObjectName("listToolBtn")
+        self.btn_multi_select.setFixedSize(28, 28)
+        self.btn_multi_select.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_multi_select.clicked.connect(self._toggle_multi_select)
+        header_layout.addWidget(self.btn_multi_select)
 
-        layout.addWidget(header_container)
+        # View toggle button (list/card)
+        self.btn_view_toggle = QPushButton()
+        self.btn_view_toggle.setObjectName("listToolBtn")
+        self.btn_view_toggle.setFixedSize(28, 28)
+        self.btn_view_toggle.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_view_toggle.clicked.connect(self._toggle_view_mode)
+        header_layout.addWidget(self.btn_view_toggle)
 
-    def _create_import_section(self, layout: QVBoxLayout) -> None:
-        """Create the import card section."""
-        import_card = QFrame()
-        import_card.setStyleSheet("""
-            QFrame { background-color: #FBFBFA; border-radius: 4px; border: none; }
-        """)
-        import_card_layout = QVBoxLayout(import_card)
-        import_card_layout.setContentsMargins(15, 15, 15, 15)
-        import_card_layout.setSpacing(10)
+        list_layout.addWidget(list_header)
 
-        # Header
-        import_header = QHBoxLayout()
-        self.btn_toggle_import = QPushButton("▼ " + self.tr('collapse_import'))
-        self.btn_toggle_import.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_toggle_import.setStyleSheet("""
-            QPushButton {
-                background-color: transparent; color: #37352F; font-weight: 600;
-                border: none; text-align: left; padding: 0; font-size: 13px;
-            }
-            QPushButton:hover { color: #787774; }
-        """)
-        self.btn_toggle_import.clicked.connect(self._toggle_import_section)
+        # Batch action bar (shown when multi-select mode is active) - placed at top
+        self.batch_action_bar = QFrame()
+        self.batch_action_bar.setObjectName("batchActionBar")
+        self.batch_action_bar.setFixedHeight(44)
+        self.batch_action_bar.setVisible(False)
 
-        self.format_hint = QLabel(self.tr('format_hint'))
-        self.format_hint.setStyleSheet("color: #6B7280; font-style: italic; font-size: 12px;")
+        batch_layout = QHBoxLayout(self.batch_action_bar)
+        batch_layout.setContentsMargins(12, 0, 12, 0)  # Match list item margins
+        batch_layout.setSpacing(6)  # Match list item spacing
 
-        import_header.addWidget(self.btn_toggle_import)
-        import_header.addStretch()
-        import_header.addWidget(self.format_hint)
-        import_card_layout.addLayout(import_header)
+        # Select all icon button
+        self.select_all_btn = QToolButton()
+        self.select_all_btn.setObjectName("selectAllBtn")
+        self.select_all_btn.setFixedSize(20, 20)
+        self.select_all_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.select_all_btn.setStyleSheet("QToolButton { background: transparent; border: none; }")
+        self.select_all_btn.clicked.connect(self._on_select_all_btn_clicked)
+        batch_layout.addWidget(self.select_all_btn)
 
-        # Content
-        self.import_content = QWidget()
-        self.import_content.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
-        import_content_layout = QVBoxLayout(self.import_content)
-        import_content_layout.setContentsMargins(0, 10, 0, 0)
-        import_content_layout.setSpacing(15)
+        self.batch_select_label = QLabel()
+        self.batch_select_label.setObjectName("batchSelectLabel")
+        batch_layout.addWidget(self.batch_select_label)
 
-        self.text_input = QPlainTextEdit()
-        self.text_input.setPlaceholderText(self.tr('paste_placeholder'))
-        self.text_input.setFixedHeight(70)
-        self.text_input.setStyleSheet("border: 1px solid #E9E9E7; border-radius: 4px; background-color: #FFFFFF; padding: 8px;")
-        import_content_layout.addWidget(self.text_input)
+        batch_layout.addStretch()
 
-        # Buttons
-        btn_row = QHBoxLayout()
-        btn_row.setSpacing(10)
-
-        self.btn_add_line = self._create_action_btn(
-            self.tr('add_account'), "#10B981", "#059669",
-            create_plus_icon(18, '#FFFFFF')
-        )
-        self.btn_add_line.clicked.connect(self._add_from_text_input)
-
-        self.btn_import = self._create_action_btn(
-            self.tr('import_file'), "#3B82F6", "#2563EB",
-            create_import_icon(18, '#FFFFFF')
-        )
-        self.btn_import.clicked.connect(self._import_from_file)
-
-        self.btn_clear = self._create_action_btn(
-            self.tr('clear_all'), "#EF4444", "#DC2626",
-            create_clear_icon(18, '#FFFFFF')
-        )
-        self.btn_clear.clicked.connect(self._clear_accounts)
-
-        btn_row.addWidget(self.btn_add_line)
-        btn_row.addWidget(self.btn_import)
-        btn_row.addStretch()
-        btn_row.addWidget(self.btn_clear)
-
-        import_content_layout.addLayout(btn_row)
-        import_card_layout.addWidget(self.import_content)
-
-        layout.addWidget(import_card)
-
-    def _create_action_btn(self, text: str, color_base: str, color_hover: str, icon_pixmap=None) -> QPushButton:
-        """Create a styled action button."""
-        btn = QPushButton(text)
-        btn.setFixedHeight(38)
-        btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        if icon_pixmap:
-            btn.setIcon(QIcon(icon_pixmap))
-            btn.setIconSize(QSize(18, 18))
-        btn.setStyleSheet(f"""
-            QPushButton {{
-                background-color: {color_base}; color: white; font-weight: 600;
-                border: none; border-radius: 8px; padding: 0 16px;
-            }}
-            QPushButton:hover {{ background-color: {color_hover}; }}
-        """)
-        return btn
-
-    def _create_content_area(self, layout: QVBoxLayout) -> None:
-        """Create the main content area with sidebar and table."""
-        self.content_splitter = QSplitter(Qt.Orientation.Horizontal)
-        self.content_splitter.setHandleWidth(1)
-        self.content_splitter.setChildrenCollapsible(False)
-
-        # Sidebar
-        self._create_sidebar()
-
-        # Table
-        self._create_table_area()
-
-        self.content_splitter.setStretchFactor(0, 0)
-        self.content_splitter.setStretchFactor(1, 1)
-        self.content_splitter.setSizes([180, 900])
-
-        layout.addWidget(self.content_splitter, 1)
-
-    def _create_sidebar(self) -> None:
-        """Create the sidebar with group list."""
-        sidebar_container = QWidget()
-        sidebar_layout = QVBoxLayout(sidebar_container)
-        sidebar_layout.setContentsMargins(0, 0, 15, 0)
-        sidebar_layout.setSpacing(10)
-
-        # Header
-        sidebar_header = QHBoxLayout()
-        self.group_label = QLabel(self.tr('groups'))
-        self.group_label.setFont(QFont("Microsoft YaHei UI", 10))
-        self.group_label.setStyleSheet("color: #5F6368;")
-        sidebar_header.addWidget(self.group_label)
-        sidebar_header.addStretch()
-
-        # Add group button
-        self.btn_add_group = QToolButton()
-        self.btn_add_group.setFixedSize(24, 24)
-        self.btn_add_group.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_add_group.setToolTip(self.tr('add_group'))
-        self.btn_add_group.setIcon(QIcon(create_plus_icon(16, '#787774')))
-        self.btn_add_group.setIconSize(QSize(16, 16))
-        self.btn_add_group.setStyleSheet("""
-            QToolButton { background: transparent; border: none; }
-            QToolButton:hover { background-color: #EFEFEF; border-radius: 4px; }
-        """)
-        self.btn_add_group.clicked.connect(lambda: self._show_manage_groups(open_add=True))
-        sidebar_header.addWidget(self.btn_add_group)
-
-        # Collapse button
-        self.btn_collapse_sidebar = QToolButton()
-        self.btn_collapse_sidebar.setFixedSize(24, 24)
-        self.btn_collapse_sidebar.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_collapse_sidebar.setToolTip(self.tr('collapse_sidebar'))
-        self.btn_collapse_sidebar.setIcon(QIcon(create_arrow_icon('left', 16, '#787774')))
-        self.btn_collapse_sidebar.setIconSize(QSize(16, 16))
-        self.btn_collapse_sidebar.setStyleSheet("""
-            QToolButton { background: transparent; border: none; }
-            QToolButton:hover { background-color: #EFEFEF; border-radius: 4px; }
-        """)
-        self.btn_collapse_sidebar.clicked.connect(self._toggle_sidebar)
-        sidebar_header.addWidget(self.btn_collapse_sidebar)
-
-        sidebar_layout.addLayout(sidebar_header)
-
-        # Group list - Notion style
-        self.group_list = QListWidget()
-        self.group_list.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.group_list.setFont(QFont("Microsoft YaHei UI", 9))
-        self.group_list.setStyleSheet("""
-            QListWidget { background: transparent; border: none; outline: none; }
-            QListWidget::item {
-                padding: 7px 10px; margin-bottom: 1px; border-radius: 4px;
-                color: #37352F;
-            }
-            QListWidget::item:hover { background-color: #EFEFEF; }
-            QListWidget::item:selected { background-color: #E9E9E7; color: #37352F; border: none; }
-        """)
-        self.group_list.itemClicked.connect(self._on_group_selected)
-        sidebar_layout.addWidget(self.group_list)
-
-        self.content_splitter.addWidget(sidebar_container)
-
-    def _create_table_area(self) -> None:
-        """Create the table container with toolbar."""
-        table_container = QFrame()
-        table_container.setStyleSheet("""
-            QFrame { background-color: #FFFFFF; border-radius: 4px; border: none; }
-        """)
-        table_layout = QVBoxLayout(table_container)
-        table_layout.setContentsMargins(0, 0, 0, 0)
-        table_layout.setSpacing(0)
-
-        # Toolbar
-        self._create_toolbar(table_layout)
-
-        # Table
-        self._create_table(table_layout)
-
-        # Footer
-        self._create_footer(table_layout)
-
-        self.content_splitter.addWidget(table_container)
-
-    def _create_toolbar(self, layout: QVBoxLayout) -> None:
-        """Create the toolbar above the table."""
-        toolbar = QWidget()
-        toolbar.setStyleSheet("background-color: transparent; border-bottom: 1px solid #E9E9E7;")
-        toolbar_layout = QHBoxLayout(toolbar)
-        toolbar_layout.setContentsMargins(15, 10, 15, 10)
-
-        # Toggle info button
-        self.btn_toggle_info = QPushButton(self.tr('show_full'))
-        self.btn_toggle_info.setIcon(QIcon(create_lock_icon(False, 16)))
-        self.btn_toggle_info.setIconSize(QSize(16, 16))
-        self.btn_toggle_info.setFixedHeight(28)
-        self.btn_toggle_info.setFont(QFont("Microsoft YaHei UI", 9))
-        self.btn_toggle_info.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_toggle_info.setStyleSheet("""
-            QPushButton { background-color: transparent; color: #5F6368;
-                         border: 1px solid #E0E0E0; border-radius: 4px; padding: 0 10px; }
-            QPushButton:hover { background-color: #F7F6F3; border-color: #D0D0D0; }
-        """)
-        self.btn_toggle_info.clicked.connect(self._toggle_info_display)
-        toolbar_layout.addWidget(self.btn_toggle_info)
-
-        toolbar_layout.addSpacing(15)
-
-        # Countdown
-        countdown_container = QWidget()
-        countdown_layout = QHBoxLayout(countdown_container)
-        countdown_layout.setContentsMargins(0, 0, 0, 0)
-        countdown_layout.setSpacing(4)
-
-        self.clock_icon_label = QLabel()
-        self.clock_icon_label.setPixmap(create_clock_icon(14, '#10B981'))
-        countdown_layout.addWidget(self.clock_icon_label)
-
-        self.countdown_label = QLabel(self.tr('code_expires') + " 30s")
-        self.countdown_label.setFont(QFont("Microsoft YaHei UI", 10))
-        self.countdown_label.setStyleSheet("color: #787774; font-weight: 500;")
-        countdown_layout.addWidget(self.countdown_label)
-
-        toolbar_layout.addWidget(countdown_container)
-
-        # Progress bar
-        self.progress_bar = QProgressBar()
-        self.progress_bar.setMaximum(30)
-        self.progress_bar.setTextVisible(False)
-        self.progress_bar.setFixedHeight(6)
-        self.progress_bar.setStyleSheet("""
-            QProgressBar { background-color: #E9E9E7; border-radius: 3px; border: none; }
-            QProgressBar::chunk { background-color: #37352F; border-radius: 3px; }
-        """)
-        toolbar_layout.addWidget(self.progress_bar, 1)
-
-        # Batch toolbar
-        self.batch_toolbar = QWidget()
-        batch_layout = QHBoxLayout(self.batch_toolbar)
-        batch_layout.setContentsMargins(15, 0, 0, 0)
-        batch_layout.setSpacing(8)
-
-        self.selected_label = QLabel("")
-        self.selected_label.setStyleSheet("color: #6366F1; font-weight: bold;")
-        batch_layout.addWidget(self.selected_label)
-
-        self.btn_batch_add_group = self._create_mini_btn(
-            self.tr('batch_add_group'), "#10B981",
-            self._batch_add_to_group, create_folder_icon(14, '#FFFFFF')
-        )
+        # Batch add to group button
+        self.btn_batch_add_group = QPushButton()
+        self.btn_batch_add_group.setObjectName("batchAddGroupBtn")
+        self.btn_batch_add_group.setFixedSize(28, 28)
+        self.btn_batch_add_group.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_batch_add_group.clicked.connect(self._show_batch_add_group_menu)
         batch_layout.addWidget(self.btn_batch_add_group)
 
-        self.btn_batch_remove_group = self._create_mini_btn(
-            self.tr('batch_remove_group'), "#F59E0B",
-            self._batch_remove_from_group, create_minus_icon(14, '#FFFFFF')
-        )
+        # Batch remove from group button
+        self.btn_batch_remove_group = QPushButton()
+        self.btn_batch_remove_group.setObjectName("batchRemoveGroupBtn")
+        self.btn_batch_remove_group.setFixedSize(28, 28)
+        self.btn_batch_remove_group.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_batch_remove_group.clicked.connect(self._show_batch_remove_group_menu)
         batch_layout.addWidget(self.btn_batch_remove_group)
 
-        self.btn_batch_delete = self._create_mini_btn(
-            self.tr('batch_delete'), "#EF4444",
-            self._batch_delete, create_trash_icon(14, '#FFFFFF')
-        )
+        # Batch copy button
+        self.btn_batch_copy = QPushButton()
+        self.btn_batch_copy.setObjectName("batchCopyBtn")
+        self.btn_batch_copy.setFixedSize(28, 28)
+        self.btn_batch_copy.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_batch_copy.clicked.connect(self._batch_copy)
+        batch_layout.addWidget(self.btn_batch_copy)
+
+        # Batch move to library button
+        self.btn_batch_move_library = QPushButton()
+        self.btn_batch_move_library.setObjectName("batchMoveLibraryBtn")
+        self.btn_batch_move_library.setFixedSize(28, 28)
+        self.btn_batch_move_library.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_batch_move_library.clicked.connect(self._show_batch_move_library_menu)
+        batch_layout.addWidget(self.btn_batch_move_library)
+
+        # Batch delete button
+        self.btn_batch_delete = QPushButton()
+        self.btn_batch_delete.setObjectName("batchDeleteBtn")
+        self.btn_batch_delete.setFixedSize(28, 28)
+        self.btn_batch_delete.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_batch_delete.clicked.connect(self._batch_delete)
         batch_layout.addWidget(self.btn_batch_delete)
 
-        self.batch_toolbar.hide()
-        toolbar_layout.addWidget(self.batch_toolbar)
+        list_layout.addWidget(self.batch_action_bar)
 
-        layout.addWidget(toolbar)
+        # Scroll area with bounce effect on wheel (Card View)
+        self.card_view_scroll = BounceScrollArea()
+        self.card_view_scroll.setObjectName("accountScroll")
+        self.card_view_scroll.setWidgetResizable(True)
+        self.card_view_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
 
-    def _create_mini_btn(self, text: str, color: str, func, icon_pixmap=None) -> QPushButton:
-        """Create a mini button for the toolbar."""
-        btn = QPushButton(text)
-        btn.setFixedHeight(28)
-        btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        if icon_pixmap:
-            btn.setIcon(QIcon(icon_pixmap))
-            btn.setIconSize(QSize(14, 14))
+        self.account_list_widget = QWidget()
+        self.account_list_layout = QVBoxLayout(self.account_list_widget)
+        self.account_list_layout.setContentsMargins(0, 0, 0, 0)
+        self.account_list_layout.setSpacing(0)
+        self.account_list_layout.addStretch()
 
-        hover_colors = {
-            "#10B981": "#059669",
-            "#F59E0B": "#D97706",
-            "#EF4444": "#DC2626",
-        }
-        hover_color = hover_colors.get(color, color)
+        self.card_view_scroll.setWidget(self.account_list_widget)
+        list_layout.addWidget(self.card_view_scroll, 1)
 
-        btn.setStyleSheet(f"""
-            QPushButton {{ background-color: {color}; color: white; font-size: 12px;
-                          font-weight: 600; border: none; border-radius: 6px; padding: 0 10px; }}
-            QPushButton:hover {{ background-color: {hover_color}; }}
-        """)
-        btn.clicked.connect(func)
-        return btn
+        # Table view (List View) with bounce effect
+        self.table_view = BounceTableWidget()
+        self.table_view.setObjectName("accountTable")
+        self.table_view.setColumnCount(8)
+        self.table_view.setShowGrid(False)
+        self.table_view.setAlternatingRowColors(False)
+        self.table_view.setFrameShape(QFrame.Shape.NoFrame)
+        self.table_view.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.table_view.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        self.table_view.verticalHeader().setVisible(False)
+        self.table_view.verticalHeader().setDefaultSectionSize(36)
+        self.table_view.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table_view.cellClicked.connect(self._on_table_cell_clicked)
+        self.table_view.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.table_view.customContextMenuRequested.connect(self._on_table_context_menu)
+        self.selected_table_row = -1  # Track selected row in table view
 
-    def _create_table(self, layout: QVBoxLayout) -> None:
-        """Create the accounts table."""
-        self.table = QTableWidget()
-        self.table.setColumnCount(10)
-        self.table.setHorizontalHeaderLabels([
-            '', self.tr('id'), self.tr('email'), self.tr('password'),
-            self.tr('secondary_email'), self.tr('2fa_key'), self.tr('2fa_code'),
-            self.tr('import_time'), self.tr('groups'), self.tr('notes')
-        ])
-
-        self.table.setShowGrid(False)
-        self.table.setAlternatingRowColors(False)
-        self.table.setFrameShape(QFrame.Shape.NoFrame)
-        self.table.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
-        self.table.verticalHeader().setVisible(False)
-        self.table.verticalHeader().setDefaultSectionSize(40)
-
-        self.table.setStyleSheet("""
-            QTableWidget { background-color: #FFFFFF; gridline-color: transparent; }
-            QHeaderView::section {
-                background-color: #FAFAFA; color: #5F6368; padding: 10px 8px;
-                border: none; border-bottom: 1px solid #E0E0E0;
-                font-size: 12px;
-            }
-        """)
-
-        # Column configuration
-        header = self.table.horizontalHeader()
+        # Configure table header
+        header = self.table_view.horizontalHeader()
         header.setStretchLastSection(False)
-        self.table.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)  # ID/Checkbox
+        self.table_view.setColumnWidth(0, 50)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)  # Email
+        self.table_view.setColumnWidth(1, 200)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)  # Password
+        self.table_view.setColumnWidth(2, 120)
+        header.setSectionResizeMode(3, QHeaderView.ResizeMode.Fixed)  # Backup
+        self.table_view.setColumnWidth(3, 140)
+        header.setSectionResizeMode(4, QHeaderView.ResizeMode.Fixed)  # 2FA Key
+        self.table_view.setColumnWidth(4, 100)
+        header.setSectionResizeMode(5, QHeaderView.ResizeMode.Fixed)  # Code
+        self.table_view.setColumnWidth(5, 80)
+        header.setSectionResizeMode(6, QHeaderView.ResizeMode.Stretch)  # Groups - stretch to fill
+        header.setSectionResizeMode(7, QHeaderView.ResizeMode.Fixed)  # Notes
+        self.table_view.setColumnWidth(7, 120)
 
-        # Column widths
-        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
-        self.table.setColumnWidth(0, 45)
-        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
-        self.table.setColumnWidth(1, 40)
-        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
-        header.setSectionResizeMode(3, QHeaderView.ResizeMode.Fixed)
-        header.setSectionResizeMode(4, QHeaderView.ResizeMode.Fixed)
-        self.table.setColumnWidth(4, 120)
-        header.setSectionResizeMode(5, QHeaderView.ResizeMode.Fixed)
-        self.table.setColumnWidth(5, 100)
-        header.setSectionResizeMode(6, QHeaderView.ResizeMode.Fixed)
-        self.table.setColumnWidth(6, 80)
-        header.setSectionResizeMode(7, QHeaderView.ResizeMode.Fixed)
-        self.table.setColumnWidth(7, 115)
-        header.setSectionResizeMode(8, QHeaderView.ResizeMode.Fixed)
-        self.table.setColumnWidth(8, 80)
-        header.setSectionResizeMode(9, QHeaderView.ResizeMode.Stretch)
+        # Set row height
+        self.table_view.verticalHeader().setDefaultSectionSize(36)
 
-        self.table.setEditTriggers(
-            QAbstractItemView.EditTrigger.DoubleClicked |
-            QAbstractItemView.EditTrigger.SelectedClicked
-        )
-        self.table.itemChanged.connect(self._on_item_changed)
-        self.table.cellClicked.connect(self._on_cell_clicked)
-        self.table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
-        self.table.customContextMenuRequested.connect(self._show_context_menu)
+        self.table_view.hide()  # Initially hidden (card view is default)
+        list_layout.addWidget(self.table_view, 1)
 
-        layout.addWidget(self.table)
+        layout.addWidget(self.list_panel)
 
-        # Create header checkbox for select all (same as main.py)
-        self.header_checkbox_widget = QWidget(self.table.horizontalHeader())
-        self.header_checkbox_widget.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
-        header_checkbox_layout = QHBoxLayout(self.header_checkbox_widget)
-        header_checkbox_layout.setContentsMargins(0, 0, 0, 0)
-        header_checkbox_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.header_checkbox = QCheckBox()
-        self.header_checkbox.setStyleSheet(f"""
-            QCheckBox::indicator {{
-                width: 18px;
-                height: 18px;
-                border: 2px solid #CBD5E1;
+    def _create_detail_panel(self, layout: QHBoxLayout) -> None:
+        """Create detail panel."""
+        self.detail_panel = QFrame()
+        self.detail_panel.setObjectName("detailPanel")
+        self.detail_panel.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
+        self.detail_panel.mousePressEvent = self._on_detail_panel_click
+
+        detail_layout = QVBoxLayout(self.detail_panel)
+        detail_layout.setContentsMargins(0, 0, 0, 0)
+        detail_layout.setSpacing(0)
+
+        # Empty state - centered in the entire detail panel
+        self.empty_state = QLabel()
+        self.empty_state.setObjectName("emptyState")
+        self.empty_state.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        # Scrollable area for detail content (bottom bounce only)
+        self.detail_scroll = BounceScrollArea(bottom_only=True)
+        self.detail_scroll.setObjectName("detailScroll")
+        self.detail_scroll.setWidgetResizable(True)
+        self.detail_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.detail_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        # Scroll area background will be set in _apply_theme for proper dark mode support
+
+        # Scroll container widget - transparent to inherit parent background
+        scroll_container = QWidget()
+        scroll_container.setObjectName("detailScrollContainer")
+        scroll_container.setStyleSheet("background: transparent;")
+        scroll_container_layout = QVBoxLayout(scroll_container)
+        scroll_container_layout.setContentsMargins(24, 24, 24, 24)
+        scroll_container_layout.setSpacing(0)
+
+        # Content wrapper for detail content
+        self.content_wrapper = QWidget()
+        self.content_wrapper.setObjectName("contentWrapper")
+        self.content_wrapper.setStyleSheet("background: transparent;")
+        self.content_wrapper.setMaximumWidth(520)
+        content_layout = QVBoxLayout(self.content_wrapper)
+        content_layout.setContentsMargins(0, 0, 0, 0)
+        content_layout.setSpacing(0)
+
+        # Detail content
+        self.detail_content = QWidget()
+        self.detail_content.setStyleSheet("background: transparent;")
+        self.detail_content.setVisible(False)
+        detail_content_layout = QVBoxLayout(self.detail_content)
+        detail_content_layout.setContentsMargins(0, 0, 0, 0)
+        detail_content_layout.setSpacing(24)
+
+        # Account header
+        header_widget = QWidget()
+        header_layout = QHBoxLayout(header_widget)
+        header_layout.setContentsMargins(0, 0, 0, 0)
+        header_layout.setSpacing(0)
+
+        header_text = QVBoxLayout()
+        header_text.setSpacing(4)
+        self.detail_name = QLabel()
+        self.detail_name.setObjectName("detailName")
+        header_text.addWidget(self.detail_name)
+        self.detail_email = QLabel()
+        self.detail_email.setObjectName("detailEmail")
+        header_text.addWidget(self.detail_email)
+        header_layout.addLayout(header_text)
+        header_layout.addStretch()
+
+        self.btn_edit = QPushButton()
+        self.btn_edit.setObjectName("iconBtn")
+        self.btn_edit.setFixedSize(32, 32)
+        self.btn_edit.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_edit.clicked.connect(self._edit_account)
+        header_layout.addWidget(self.btn_edit)
+
+        self.btn_delete = QPushButton()
+        self.btn_delete.setObjectName("deleteBtn")
+        self.btn_delete.setFixedSize(32, 32)
+        self.btn_delete.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_delete.clicked.connect(self._delete_account)
+        header_layout.addWidget(self.btn_delete)
+
+        detail_content_layout.addWidget(header_widget)
+
+        # Separator
+        sep1 = QFrame()
+        sep1.setObjectName("separator")
+        sep1.setFixedHeight(1)
+        detail_content_layout.addWidget(sep1)
+
+        # Fields container (email, password, secret, groups, notes)
+        self.fields_container = QWidget()
+        self.fields_layout = QVBoxLayout(self.fields_container)
+        self.fields_layout.setContentsMargins(0, 0, 0, 0)
+        self.fields_layout.setSpacing(16)
+        detail_content_layout.addWidget(self.fields_container)
+
+        # TOTP Section (at the bottom)
+        self.totp_section = QWidget()
+        totp_layout = QVBoxLayout(self.totp_section)
+        totp_layout.setContentsMargins(0, 0, 0, 0)
+        totp_layout.setSpacing(8)
+
+        self.totp_label = QLabel()
+        self.totp_label.setObjectName("fieldLabel")
+        totp_layout.addWidget(self.totp_label)
+
+        totp_row = QHBoxLayout()
+        totp_row.setSpacing(12)
+
+        self.totp_display = QLabel("--- ---")
+        self.totp_display.setObjectName("totpDisplay")
+        self.totp_display.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        totp_row.addWidget(self.totp_display, 1)
+
+        self.btn_copy_totp = QPushButton()
+        self.btn_copy_totp.setObjectName("copyBtn")
+        self.btn_copy_totp.setFixedSize(36, 36)
+        self.btn_copy_totp.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_copy_totp.clicked.connect(self._copy_totp_code)
+        totp_row.addWidget(self.btn_copy_totp)
+
+        totp_layout.addLayout(totp_row)
+
+        # Progress bar
+        progress_row = QHBoxLayout()
+        progress_row.setSpacing(8)
+
+        self.totp_progress = QProgressBar()
+        self.totp_progress.setObjectName("totpProgress")
+        self.totp_progress.setTextVisible(False)
+        self.totp_progress.setFixedHeight(4)
+        self.totp_progress.setRange(0, 30)
+        progress_row.addWidget(self.totp_progress, 1)
+
+        self.totp_timer = QLabel("30s")
+        self.totp_timer.setObjectName("totpTimer")
+        self.totp_timer.setFixedWidth(32)
+        self.totp_timer.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        progress_row.addWidget(self.totp_timer)
+
+        totp_layout.addLayout(progress_row)
+        detail_content_layout.addWidget(self.totp_section)
+
+        # Notes section (below TOTP)
+        self.notes_section = QWidget()
+        notes_layout = QVBoxLayout(self.notes_section)
+        notes_layout.setContentsMargins(0, 0, 0, 0)
+        notes_layout.setSpacing(6)
+
+        self.notes_label = QLabel()
+        self.notes_label.setObjectName("fieldLabel")
+        notes_layout.addWidget(self.notes_label)
+
+        self.notes_edit = QTextEdit()
+        self.notes_edit.setObjectName("notesEdit")
+        self.notes_edit.setReadOnly(True)
+        self.notes_edit.setMinimumHeight(120)
+        self.notes_edit.setMaximumHeight(300)
+        self.notes_edit.setCursor(Qt.CursorShape.PointingHandCursor)
+        # Use event filter on viewport for click handling
+        self.notes_edit.viewport().installEventFilter(self)
+        self.notes_edit.installEventFilter(self)
+        notes_layout.addWidget(self.notes_edit)
+
+        detail_content_layout.addWidget(self.notes_section)
+
+        detail_content_layout.addStretch()
+        content_layout.addWidget(self.detail_content)
+
+        # Add content_wrapper to scroll container
+        scroll_container_layout.addWidget(self.content_wrapper)
+        scroll_container_layout.addStretch()
+
+        # Set scroll container as scroll area widget
+        self.detail_scroll.setWidget(scroll_container)
+
+        # Empty state container - centered vertically
+        self.empty_container = QWidget()
+        empty_layout = QVBoxLayout(self.empty_container)
+        empty_layout.setContentsMargins(24, 24, 24, 24)
+        empty_layout.addStretch()
+        empty_layout.addWidget(self.empty_state, 0, Qt.AlignmentFlag.AlignCenter)
+        empty_layout.addStretch()
+
+        # Add both containers to detail layout (mutually exclusive)
+        detail_layout.addWidget(self.empty_container)
+        detail_layout.addWidget(self.detail_scroll)
+
+        layout.addWidget(self.detail_panel, 1)
+
+    def _apply_theme(self) -> None:
+        """Apply current theme."""
+        t = get_theme()
+        is_dark = get_theme_manager().is_dark
+
+        # Library button colors: light mode = pure black, dark mode = softer gray
+        lib_btn_bg = "#9CA3AF" if is_dark else t.text_primary
+        lib_btn_hover = "#D1D5DB" if is_dark else t.text_secondary
+
+        # Bottom buttons colors: dark mode = visible background, light mode = transparent
+        bottom_btn_bg = t.bg_tertiary if is_dark else t.bg_primary
+        bottom_btn_hover = "#4B5563" if is_dark else t.bg_hover
+
+        # Green selection color
+        selection_bg = "#065F46" if is_dark else "#10B981"
+        selection_color = "#FFFFFF"
+
+        self.setStyleSheet(f"""
+            QMainWindow {{
+                background-color: {t.bg_primary};
+            }}
+
+            /* Global text selection color (green) */
+            QLineEdit {{
+                selection-background-color: {selection_bg};
+                selection-color: {selection_color};
+            }}
+            QTextEdit {{
+                selection-background-color: {selection_bg};
+                selection-color: {selection_color};
+            }}
+            QPlainTextEdit {{
+                selection-background-color: {selection_bg};
+                selection-color: {selection_color};
+            }}
+
+            /* Sidebar */
+            #sidebar {{
+                background-color: {t.bg_secondary};
+                border-right: 1px solid {t.border};
+            }}
+
+            #libraryFrame {{
+                background-color: {t.bg_secondary};
+                border-bottom: 1px solid {t.border};
+            }}
+
+            #libraryBtn {{
+                background-color: {lib_btn_bg};
+                border: none;
+                border-radius: 6px;
+                padding: 8px 12px;
+                text-align: left;
+                font-size: 13px;
+                font-weight: 500;
+                color: {t.bg_primary};
+            }}
+            #libraryBtn:hover {{
+                background-color: {lib_btn_hover};
+            }}
+
+            #libraryPanel {{
+                background-color: {t.bg_secondary};
+                border: 1px solid {t.border};
+                border-radius: 8px;
+            }}
+
+            .libraryCard {{
+                background-color: {t.bg_secondary};
+                border: none;
+                border-radius: 6px;
+                padding: 8px 12px;
+                font-size: 13px;
+                font-weight: 500;
+                color: {lib_btn_bg};
+            }}
+            .libraryCard:hover {{
+                background-color: {t.bg_hover};
+            }}
+
+            .libraryCardInactive {{
+                background-color: {lib_btn_bg};
+                border: none;
+                border-radius: 6px;
+                padding: 8px 12px;
+                font-size: 13px;
+                font-weight: 500;
+                color: {t.bg_primary};
+            }}
+            .libraryCardInactive:hover {{
+                background-color: {lib_btn_hover};
+            }}
+
+            #groupsScroll {{
+                background-color: {t.bg_secondary};
+                border: none;
+            }}
+            #groupsScroll > QWidget > QWidget {{
+                background-color: {t.bg_secondary};
+            }}
+
+            #groupsHeader {{
+                background-color: {t.bg_secondary};
+            }}
+
+            #groupsTitle {{
+                font-size: 11px;
+                font-weight: 600;
+                color: {t.text_secondary};
+                text-transform: uppercase;
+                letter-spacing: 0.5px;
+            }}
+
+            #editGroupsBtn {{
+                background-color: transparent;
+                border: none;
                 border-radius: 4px;
-                background-color: #FFFFFF;
+                padding: 4px 8px;
+                font-size: 11px;
+                font-weight: 500;
+                color: {t.text_secondary};
             }}
-            QCheckBox::indicator:hover {{
-                border-color: #3B82F6;
-                background-color: #EFF6FF;
+            #editGroupsBtn:hover {{
+                background-color: {t.bg_hover};
+                color: {t.text_primary};
             }}
-            QCheckBox::indicator:checked {{
-                background-color: #3B82F6;
-                border-color: #3B82F6;
-                image: url({CHECK_SVG_PATH});
+
+            #bottomFrame {{
+                background-color: {t.bg_secondary};
+                border-top: 1px solid {t.border};
             }}
-            QCheckBox::indicator:checked:hover {{
-                background-color: #2563EB;
-                border-color: #2563EB;
+
+            #importBtn {{
+                background-color: {bottom_btn_bg};
+                border: 1px solid {t.border};
+                border-radius: 6px;
+                color: {t.text_secondary};
+                font-size: 13px;
+            }}
+            #importBtn:hover {{
+                background-color: {bottom_btn_hover};
+                border-color: {t.text_tertiary};
+                color: {t.text_primary};
+            }}
+
+            #addAccountBtn {{
+                background-color: {bottom_btn_bg};
+                border: 1px solid {t.border};
+                border-radius: 6px;
+                color: {t.text_secondary};
+                font-weight: 500;
+                font-size: 13px;
+            }}
+            #addAccountBtn:hover {{
+                background-color: {bottom_btn_hover};
+                border-color: {t.text_tertiary};
+                color: {t.text_primary};
+            }}
+
+            /* Header */
+            #header {{
+                background-color: {t.bg_primary};
+                border-bottom: 1px solid {t.border};
+            }}
+
+            #searchContainer {{
+                background-color: {t.bg_secondary};
+                border: none;
+                border-bottom: 1px solid {t.border};
+                border-radius: 0px;
+                height: 36px;
+            }}
+            #searchContainer:hover {{
+                background-color: {t.bg_tertiary};
+            }}
+            #searchContainer:focus-within {{
+                background-color: {t.bg_tertiary};
+            }}
+
+            #searchInput {{
+                background: transparent;
+                border: none;
+                font-size: 13px;
+                color: {t.text_primary};
+            }}
+
+            #listToolBtn {{
+                background-color: transparent;
+                border: none;
+                border-radius: 4px;
+            }}
+            #listToolBtn:hover {{
+                background-color: {t.bg_hover};
+            }}
+
+            #batchActionBar {{
+                background-color: {t.bg_secondary};
+                border-top: 1px solid {t.border};
+            }}
+            #batchSelectLabel {{
+                font-size: 12px;
+                color: {t.text_secondary};
+            }}
+            #batchAddGroupBtn, #batchRemoveGroupBtn, #batchCopyBtn, #batchMoveLibraryBtn, #batchDeleteBtn {{
+                background-color: transparent;
+                border: none;
+                border-radius: 4px;
+            }}
+            #batchAddGroupBtn:hover, #batchRemoveGroupBtn:hover, #batchCopyBtn:hover, #batchMoveLibraryBtn:hover {{
+                background-color: {t.bg_hover};
+            }}
+            #batchDeleteBtn:hover {{
+                background-color: {t.error}15;
+            }}
+
+            #toolBtn {{
+                background-color: transparent;
+                border: none;
+                border-radius: 6px;
+            }}
+            #toolBtn:hover {{
+                background-color: {t.bg_hover};
+            }}
+
+            /* Account List */
+            #accountListPanel {{
+                background-color: {t.bg_primary};
+                border-right: 1px solid {t.border};
+            }}
+
+            #listHeader {{
+                background-color: {t.bg_primary};
+                border-bottom: 1px solid {t.border};
+            }}
+
+            #listTitle {{
+                font-size: 11px;
+                font-weight: 500;
+                color: {t.text_tertiary};
+                text-transform: uppercase;
+                letter-spacing: 0.5px;
+            }}
+
+            #accountScroll {{
+                background-color: {t.bg_primary};
+                border: none;
+            }}
+            #accountScroll > QWidget > QWidget {{
+                background-color: {t.bg_primary};
+            }}
+
+            /* Table View */
+            #accountTable {{
+                background-color: {t.bg_primary};
+                border: none;
+                gridline-color: transparent;
+                outline: none;
+            }}
+            #accountTable QHeaderView::section {{
+                background-color: {t.bg_primary};
+                color: {t.text_tertiary};
+                padding: 10px 8px;
+                border: none;
+                border-bottom: 1px solid {t.border};
+                font-weight: 600;
+                font-size: 11px;
+            }}
+
+            /* Detail Panel */
+            #detailPanel {{
+                background-color: {t.bg_primary};
+            }}
+
+            #emptyState {{
+                font-size: 14px;
+                color: {t.text_tertiary};
+            }}
+
+            #detailName {{
+                font-size: 20px;
+                font-weight: 600;
+                color: {t.text_primary};
+            }}
+
+            #detailEmail {{
+                font-size: 13px;
+                color: {t.text_secondary};
+            }}
+
+            #iconBtn {{
+                background-color: transparent;
+                border: none;
+                border-radius: 6px;
+            }}
+            #iconBtn:hover {{
+                background-color: {t.bg_hover};
+            }}
+
+            #deleteBtn {{
+                background-color: transparent;
+                border: none;
+                border-radius: 6px;
+            }}
+            #deleteBtn:hover {{
+                background-color: {t.error}20;
+            }}
+
+            #separator {{
+                background-color: {t.border};
+            }}
+
+            #fieldLabel {{
+                font-size: 11px;
+                font-weight: 500;
+                color: {t.text_tertiary};
+                text-transform: uppercase;
+                letter-spacing: 0.5px;
+            }}
+
+            #totpDisplay {{
+                background-color: {t.bg_tertiary};
+                border: 1px solid {t.border};
+                border-radius: 6px;
+                padding: 8px;
+                font-family: "Consolas", "Monaco", monospace;
+                font-size: 20px;
+                font-weight: 600;
+                color: {t.success};
+                letter-spacing: 3px;
+            }}
+
+            #copyBtn {{
+                background-color: transparent;
+                border: none;
+                border-radius: 8px;
+            }}
+            #copyBtn:hover {{
+                background-color: {t.bg_hover};
+            }}
+
+            #totpProgress {{
+                background-color: {t.bg_tertiary};
+                border: none;
+                border-radius: 2px;
+            }}
+            #totpProgress::chunk {{
+                background-color: {t.success};
+                border-radius: 2px;
+            }}
+
+            #totpTimer {{
+                font-size: 11px;
+                color: {t.text_tertiary};
+            }}
+
+            #notesEdit {{
+                background-color: transparent;
+                border: none;
+                color: {t.text_secondary};
+                font-size: 13px;
+                padding: 4px 0;
+            }}
+            #notesEdit:focus {{
+                background-color: transparent;
+                border: none;
+            }}
+
+            /* Toast - iOS-style glassmorphism */
+            /* Light mode: dark glass with white text, Dark mode: light glass with dark text */
+            #toast {{
+                background-color: {"rgba(250, 250, 250, 0.82)" if is_dark else "rgba(30, 30, 30, 0.82)"};
+                padding: 10px 20px;
+                border-radius: 12px;
+                border: 1px solid {"rgba(255, 255, 255, 0.25)" if is_dark else "rgba(255, 255, 255, 0.08)"};
+                font-size: 13px;
+            }}
+            #toast QLabel {{
+                background: transparent;
+                color: {"#1F2937" if is_dark else "#FFFFFF"};
+                font-weight: 500;
+            }}
+            #toast QPushButton {{
+                background: transparent;
+                border: none;
+                color: {"#10B981" if is_dark else "#6EE7B7"};
+                font-weight: 600;
+                padding: 0 4px;
+            }}
+            #toast QPushButton:hover {{
+                color: {"#059669" if is_dark else "#A7F3D0"};
+            }}
+
+            /* Scrollbar */
+            QScrollBar:vertical {{
+                background: transparent;
+                width: 6px;
+                margin: 0;
+            }}
+            QScrollBar::handle:vertical {{
+                background: {t.text_tertiary};
+                border-radius: 3px;
+                min-height: 30px;
+            }}
+            QScrollBar::handle:vertical:hover {{
+                background: {t.text_secondary};
+            }}
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{
+                height: 0;
+            }}
+            QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {{
+                background: transparent;
+            }}
+
+            QLineEdit {{
+                background-color: {t.bg_tertiary};
+                border: 1px solid {t.border};
+                border-radius: 6px;
+                padding: 8px 12px;
+                font-size: 13px;
+                color: {t.text_primary};
+            }}
+            QLineEdit:focus {{
+                border-color: {t.accent};
+            }}
+
+            /* Menu */
+            QMenu {{
+                background-color: {t.bg_primary};
+                border: 1px solid {t.border};
+                border-radius: 8px;
+                padding: 4px;
+            }}
+            QMenu::item {{
+                padding: 8px 16px;
+                border-radius: 4px;
+                color: {t.text_primary};
+            }}
+            QMenu::item:selected {{
+                background-color: {t.bg_hover};
+            }}
+            QMenu::separator {{
+                height: 1px;
+                background: {t.border};
+                margin: 4px 8px;
             }}
         """)
-        header_checkbox_layout.addWidget(self.header_checkbox)
-        self.header_checkbox.stateChanged.connect(self._on_header_checkbox_changed)
-        self._update_header_checkbox_position()
 
-    def _create_footer(self, layout: QVBoxLayout) -> None:
-        """Create the footer with status info."""
-        footer = QWidget()
-        footer.setStyleSheet("background-color: transparent; border-top: 1px solid #F3F4F6;")
-        footer_layout = QHBoxLayout(footer)
-        footer_layout.setContentsMargins(15, 8, 15, 8)
+        # Ensure detail scroll area uses theme background color for dark mode
+        self.detail_scroll.setStyleSheet(f"QScrollArea {{ background-color: {t.bg_primary}; border: none; }}")
+        self.detail_scroll.viewport().setStyleSheet(f"background-color: {t.bg_primary};")
 
-        self.count_label = QLabel(f"{self.tr('accounts')}: 0")
-        self.count_label.setStyleSheet("color: #6B7280; font-weight: 600; font-size: 12px;")
-        footer_layout.addWidget(self.count_label)
+        self._update_icons()
+        self._update_ui_text()
 
-        footer_layout.addSpacing(20)
+    def _update_icons(self) -> None:
+        """Update all icons for current theme."""
+        t = get_theme()
+        ic = t.text_secondary
 
-        self.copy_hint_label = QLabel(self.tr('click_to_copy'))
-        self.copy_hint_label.setStyleSheet("color: #9CA3AF; font-size: 12px; font-style: italic;")
-        footer_layout.addWidget(self.copy_hint_label)
+        # Library button - just show library name
+        current = self.library_service.get_current_library()
+        self.btn_library.setIcon(QIcon(icon_library(16, t.bg_primary)))
+        self.btn_library.setText(f"  {current.name}  ")
 
-        footer_layout.addStretch()
+        # Search
+        self.search_icon.setPixmap(icon_search(16, t.text_tertiary))
 
-        self.status_label = QLabel("")
-        self.status_label.setStyleSheet("color: #6B7280; font-size: 12px;")
-        footer_layout.addWidget(self.status_label)
+        # Multi-select button (in list header) - green when active
+        self.btn_multi_select.setIcon(QIcon(icon_checkbox(14, t.success if self.multi_select_mode else ic)))
 
-        layout.addWidget(footer)
+        # View toggle button (in list header)
+        if self.list_view_mode:
+            self.btn_view_toggle.setIcon(QIcon(icon_grid(14, ic)))
+        else:
+            self.btn_view_toggle.setIcon(QIcon(icon_list(14, ic)))
 
-    # ========== Event Handlers ==========
+        # Toggle codes button
+        if self.codes_visible:
+            self.btn_toggle_codes.setIcon(QIcon(icon_eye(18, ic)))
+        else:
+            self.btn_toggle_codes.setIcon(QIcon(icon_eye_off(18, ic)))
 
-    def _switch_language(self) -> None:
-        """Toggle between English and Chinese."""
-        self.state.language = 'zh' if self.state.language == 'en' else 'en'
-        self._update_ui_language()
+        # Theme button
+        if self.theme_manager.is_dark:
+            self.btn_theme.setIcon(QIcon(icon_sun(18, ic)))
+        else:
+            self.btn_theme.setIcon(QIcon(icon_moon(18, ic)))
+
+        # Language & Settings
+        from .icons import icon_globe
+        self.btn_language.setIcon(QIcon(icon_globe(18, ic)))
+        self.btn_settings.setIcon(QIcon(icon_settings(18, ic)))
+
+        # Import button
+        self.btn_import.setIcon(QIcon(icon_import(16, ic)))
+
+        # Add account - icon color matches text color
+        self.btn_add_account.setIcon(QIcon(icon_plus(16, t.text_secondary)))
+
+        # Detail panel
+        self.btn_edit.setIcon(QIcon(icon_edit(16, ic)))
+        self.btn_delete.setIcon(QIcon(icon_trash(16, t.error)))
+        self.btn_copy_totp.setIcon(QIcon(icon_copy(18, ic)))
+
+        # Batch action buttons
+        self.btn_batch_add_group.setIcon(QIcon(icon_square_plus(14, ic)))
+        self.btn_batch_remove_group.setIcon(QIcon(icon_square_minus(14, ic)))
+        self.btn_batch_copy.setIcon(QIcon(icon_copy(14, ic)))
+        self.btn_batch_move_library.setIcon(QIcon(icon_library_move(14, ic)))
+        self.btn_batch_delete.setIcon(QIcon(icon_trash(14, t.error)))
+
+    def _update_ui_text(self) -> None:
+        """Update all UI text for current language."""
+        lang = self.state.language
+        zh = lang == 'zh'
+
+        self.search_input.setPlaceholderText("搜索账户..." if zh else "Search accounts...")
+        self.btn_import.setText("  批量导入" if zh else "  Batch Import")
+        self.btn_add_account.setText("  添加账户" if zh else "  Add Account")
+        self.empty_state.setText("选择一个账户查看详情" if zh else "Select an account to view details")
+        self.totp_label.setText("验证码" if zh else "Verification Code")
+
+    def _toggle_library_panel(self) -> None:
+        """Toggle library panel visibility."""
+        # Check if panel was just closed (prevents re-open when clicking to close)
+        if not self._should_show_menu("library_panel"):
+            return
+
+        if self.library_panel.isVisible():
+            self.library_panel.hide()
+            self._editing_library_id = None
+            return
+
+        self._editing_library_id = None
+        self._refresh_library_panel()
+
+        # Position below the library button, aligned with sidebar
+        btn_pos = self.btn_library.mapToGlobal(self.btn_library.rect().bottomLeft())
+        self.library_panel.move(btn_pos)
+        self.library_panel.show()
+
+    def _refresh_library_panel(self) -> None:
+        """Refresh library panel with cards."""
+        # Clear existing
+        while self.library_panel_layout.count():
+            item = self.library_panel_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+
+        t = get_theme()
+        zh = self.state.language == 'zh'
+        libraries = self.library_service.list_libraries()
+        current = self.library_service.get_current_library()
+
+        # Calculate width based on whether we're in edit mode
+        card_width = self.btn_library.width()
+        editing_id = getattr(self, '_editing_library_id', None)
+
+        for idx, lib in enumerate(libraries):
+            is_current = lib.id == current.id
+            is_editing = lib.id == editing_id
+            row = self._create_library_row(lib, is_current, is_editing, idx, len(libraries), card_width)
+            self.library_panel_layout.addWidget(row)
+
+        # Add new library button or show new card if in create mode
+        if hasattr(self, '_creating_new_library') and self._creating_new_library:
+            new_row = self._create_new_library_row(card_width)
+            self.library_panel_layout.addWidget(new_row)
+            self._creating_new_library = False
+        else:
+            add_btn = QPushButton("+ " + ("新建账号库" if zh else "New Library"))
+            add_btn.setFixedWidth(card_width)
+            add_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            is_dark = get_theme_manager().is_dark
+            # Green colors: darker for dark mode, brighter for light mode
+            green_bg = "#065F46" if is_dark else "#10B981"
+            green_hover = "#047857" if is_dark else "#059669"
+            add_btn.setStyleSheet(f"""
+                QPushButton {{
+                    background-color: {green_bg};
+                    border: none;
+                    border-radius: 6px;
+                    padding: 8px 12px;
+                    font-size: 13px;
+                    color: white;
+                }}
+                QPushButton:hover {{
+                    background-color: {green_hover};
+                }}
+            """)
+            add_btn.clicked.connect(self._start_new_library)
+            self.library_panel_layout.addWidget(add_btn)
+
+    def _create_library_row(self, lib, is_current: bool, is_editing: bool, idx: int, total: int, card_width: int) -> QFrame:
+        """Create a library row with card and floating buttons."""
+        from .icons import icon_library, icon_edit
+        t = get_theme()
+        is_dark = get_theme_manager().is_dark
+        zh = self.state.language == 'zh'
+
+        # Button colors: light mode = pure black, dark mode = softer gray
+        btn_bg = "#9CA3AF" if is_dark else t.text_primary
+        btn_hover = "#D1D5DB" if is_dark else t.text_secondary
+
+        # Edit mode colors: darker for dark mode to avoid being too bright
+        success_color = "#059669" if is_dark else t.success
+        success_hover = "#047857" if is_dark else "#059669"
+        error_color = "#DC2626" if is_dark else t.error
+        error_hover = "#B91C1C" if is_dark else "#DC2626"
+        selection_color = "#047857" if is_dark else t.success
+
+        row = QFrame()
+        row.setStyleSheet("background: transparent;")
+        row_layout = QHBoxLayout(row)
+        row_layout.setContentsMargins(0, 0, 0, 0)
+        row_layout.setSpacing(4)
+        row_layout.setAlignment(Qt.AlignmentFlag.AlignLeft)
+
+        # Main card - all cards are black, only selected one is white
+        card = QFrame()
+        card.setFixedWidth(card_width)
+        card.setFixedHeight(36)
+        card.setCursor(Qt.CursorShape.PointingHandCursor)
+        card_layout = QHBoxLayout(card)
+        card_layout.setContentsMargins(12, 0, 12, 0)
+        card_layout.setSpacing(10)
+
+        # Card style: selected = slightly different from bg for visibility
+        if is_current:
+            # Selected: darker in dark mode, deeper gray in light mode
+            selected_bg = "#4B5563" if is_dark else "#D1D5DB"
+            card.setStyleSheet(f"""
+                QFrame {{
+                    background-color: {selected_bg};
+                    border: none;
+                    border-radius: 6px;
+                }}
+            """)
+            text_color = t.text_primary
+            icon_color = t.text_secondary
+        else:
+            # Not selected: same color as library button
+            card.setStyleSheet(f"""
+                QFrame {{
+                    background-color: {btn_bg};
+                    border: none;
+                    border-radius: 6px;
+                }}
+                QFrame:hover {{
+                    background-color: {btn_hover};
+                }}
+            """)
+            text_color = t.bg_primary
+            icon_color = t.bg_secondary
+
+        # Library icon - transparent background
+        icon_label = QLabel()
+        icon_label.setStyleSheet("background: transparent;")
+        icon_label.setPixmap(icon_library(16, text_color))
+        card_layout.addWidget(icon_label)
+
+        if is_editing:
+            # Edit mode: show input field with green selection highlight
+            name_input = QLineEdit(lib.name)
+            name_input.setStyleSheet(f"""
+                QLineEdit {{
+                    background-color: transparent;
+                    border: none;
+                    font-size: 13px;
+                    font-weight: 500;
+                    color: {text_color};
+                    selection-background-color: {selection_color};
+                    selection-color: white;
+                }}
+            """)
+            name_input.selectAll()
+            card_layout.addWidget(name_input, 1)
+            # Store for later use
+            row.name_input = name_input
+        else:
+            # Normal mode: show label - transparent background
+            name_label = QLabel(lib.name)
+            name_label.setStyleSheet(f"""
+                background: transparent;
+                font-size: 13px;
+                font-weight: 500;
+                color: {text_color};
+            """)
+            card_layout.addWidget(name_label, 1)
+
+        # Click on card = switch library (only in non-edit mode)
+        if not is_editing:
+            card.mousePressEvent = lambda e: self._on_library_card_click(lib)
+        row_layout.addWidget(card)
+
+        # Edit/Confirm button - black when not editing, green when editing
+        edit_btn = QPushButton()
+        edit_btn.setFixedSize(36, 36)
+        edit_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+
+        if is_editing:
+            # Green confirm button
+            edit_btn.setText("✓")
+            edit_btn.setStyleSheet(f"""
+                QPushButton {{
+                    background-color: {success_color};
+                    border: none;
+                    border-radius: 6px;
+                    font-size: 14px;
+                    font-weight: bold;
+                    color: white;
+                }}
+                QPushButton:hover {{
+                    background-color: {success_hover};
+                }}
+            """)
+        else:
+            # Edit button - use softer color in dark mode
+            edit_btn.setIcon(QIcon(icon_edit(14, t.bg_primary)))
+            edit_btn.setIconSize(QSize(14, 14))
+            edit_btn.setStyleSheet(f"""
+                QPushButton {{
+                    background-color: {btn_bg};
+                    border: none;
+                    border-radius: 6px;
+                }}
+                QPushButton:hover {{
+                    background-color: {btn_hover};
+                }}
+            """)
+
+        edit_btn.clicked.connect(lambda: self._toggle_library_edit(lib.id))
+        row_layout.addWidget(edit_btn)
+
+        # Action buttons (only visible when editing)
+        if is_editing:
+            # Up button - softer color in dark mode
+            up_btn = QPushButton()
+            up_btn.setFixedSize(36, 36)
+            up_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            up_btn.setText("↑")
+            up_btn.setEnabled(idx > 0)
+            up_btn.setStyleSheet(f"""
+                QPushButton {{
+                    background-color: {btn_bg};
+                    border: none;
+                    border-radius: 6px;
+                    font-size: 14px;
+                    font-weight: bold;
+                    color: {t.bg_primary if idx > 0 else t.bg_secondary};
+                }}
+                QPushButton:hover:enabled {{
+                    background-color: {btn_hover};
+                }}
+            """)
+            up_btn.clicked.connect(lambda: self._reorder_library(lib.id, -1))
+            row_layout.addWidget(up_btn)
+
+            # Down button - softer color in dark mode
+            down_btn = QPushButton()
+            down_btn.setFixedSize(36, 36)
+            down_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            down_btn.setText("↓")
+            down_btn.setEnabled(idx < total - 1)
+            down_btn.setStyleSheet(f"""
+                QPushButton {{
+                    background-color: {btn_bg};
+                    border: none;
+                    border-radius: 6px;
+                    font-size: 14px;
+                    font-weight: bold;
+                    color: {t.bg_primary if idx < total - 1 else t.bg_secondary};
+                }}
+                QPushButton:hover:enabled {{
+                    background-color: {btn_hover};
+                }}
+            """)
+            down_btn.clicked.connect(lambda: self._reorder_library(lib.id, 1))
+            row_layout.addWidget(down_btn)
+
+            # Delete button - red, square (only if more than one library)
+            if total > 1:
+                del_btn = QPushButton()
+                del_btn.setFixedSize(36, 36)
+                del_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+                del_btn.setText("×")
+                del_btn.setStyleSheet(f"""
+                    QPushButton {{
+                        background-color: {error_color};
+                        border: none;
+                        border-radius: 6px;
+                        font-size: 16px;
+                        font-weight: bold;
+                        color: white;
+                    }}
+                    QPushButton:hover {{
+                        background-color: {error_hover};
+                    }}
+                """)
+                del_btn.clicked.connect(lambda: self._confirm_delete_library(lib))
+                row_layout.addWidget(del_btn)
+
+            # Store input reference and focus it
+            self._editing_input = name_input
+            QTimer.singleShot(50, name_input.setFocus)
+
+        return row
+
+    def _confirm_library_rename(self, lib, row) -> None:
+        """Confirm renaming a library."""
+        if hasattr(row, 'name_input'):
+            new_name = row.name_input.text().strip()
+            if new_name and new_name != lib.name:
+                self.library_service.rename_library(lib.id, new_name)
+                self._update_icons()
+        self._editing_library_id = None
+        self._refresh_library_panel()
+
+    def _create_new_library_row(self, card_width: int) -> QFrame:
+        """Create a row for new library input."""
+        from .icons import icon_library
+        t = get_theme()
+        is_dark = get_theme_manager().is_dark
+        zh = self.state.language == 'zh'
+
+        # Button colors: light mode = pure black, dark mode = softer gray
+        btn_bg = "#9CA3AF" if is_dark else t.text_primary
+        btn_hover = "#D1D5DB" if is_dark else t.text_secondary
+
+        row = QFrame()
+        row.setStyleSheet("background: transparent;")
+        row_layout = QHBoxLayout(row)
+        row_layout.setContentsMargins(0, 0, 0, 0)
+        row_layout.setSpacing(4)
+        row_layout.setAlignment(Qt.AlignmentFlag.AlignLeft)
+
+        # Main card with input - softer color in dark mode
+        card = QFrame()
+        card.setFixedWidth(card_width)
+        card.setFixedHeight(36)
+        card.setStyleSheet(f"""
+            QFrame {{
+                background-color: {btn_bg};
+                border: none;
+                border-radius: 6px;
+            }}
+        """)
+        card_layout = QHBoxLayout(card)
+        card_layout.setContentsMargins(12, 0, 12, 0)
+        card_layout.setSpacing(10)
+
+        # Library icon - white for black background
+        icon_label = QLabel()
+        icon_label.setPixmap(icon_library(16, t.bg_primary))
+        card_layout.addWidget(icon_label)
+
+        # Name input - white text for black background
+        name_input = QLineEdit()
+        name_input.setPlaceholderText("输入名称..." if zh else "Enter name...")
+        name_input.setStyleSheet(f"""
+            QLineEdit {{
+                background-color: transparent;
+                border: none;
+                font-size: 13px;
+                font-weight: 500;
+                color: {t.bg_primary};
+            }}
+            QLineEdit::placeholder {{
+                color: {t.bg_secondary};
+            }}
+        """)
+        card_layout.addWidget(name_input, 1)
+        row_layout.addWidget(card)
+
+        # Confirm button - softer color in dark mode
+        confirm_btn = QPushButton()
+        confirm_btn.setFixedSize(36, 36)
+        confirm_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        confirm_btn.setText("✓")
+        confirm_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {btn_bg};
+                border: none;
+                border-radius: 6px;
+                font-size: 14px;
+                color: {t.bg_primary};
+            }}
+            QPushButton:hover {{
+                background-color: {btn_hover};
+            }}
+        """)
+        confirm_btn.clicked.connect(lambda: self._confirm_new_library(name_input))
+        name_input.returnPressed.connect(lambda: self._confirm_new_library(name_input))
+        row_layout.addWidget(confirm_btn)
+
+        # Cancel button - softer color in dark mode
+        cancel_btn = QPushButton()
+        cancel_btn.setFixedSize(36, 36)
+        cancel_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        cancel_btn.setText("×")
+        cancel_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {btn_bg};
+                border: none;
+                border-radius: 6px;
+                font-size: 16px;
+                color: {t.bg_secondary};
+            }}
+            QPushButton:hover {{
+                background-color: {btn_hover};
+                color: {t.bg_primary};
+            }}
+        """)
+        cancel_btn.clicked.connect(self._refresh_library_panel)
+        row_layout.addWidget(cancel_btn)
+
+        # Focus input after display
+        QTimer.singleShot(100, name_input.setFocus)
+
+        return row
+
+    def _on_library_card_click(self, lib) -> None:
+        """Handle click on library card."""
+        self._switch_library(lib.id)
+        self.library_panel.hide()
+
+    def _toggle_library_edit(self, library_id: str) -> None:
+        """Toggle edit mode for a library."""
+        # If closing edit mode, save any rename first
+        if getattr(self, '_editing_library_id', None) == library_id:
+            # Save rename if there's an input with changes
+            if hasattr(self, '_editing_input') and self._editing_input:
+                new_name = self._editing_input.text().strip()
+                lib = self.library_service.get_library_by_id(library_id)
+                if lib and new_name and new_name != lib.name:
+                    self.library_service.rename_library(library_id, new_name)
+                    self._update_icons()
+            self._editing_library_id = None
+            self._editing_input = None
+        else:
+            self._editing_library_id = library_id
+        self._refresh_library_panel()
+
+    def _confirm_new_library(self, name_input: QLineEdit) -> None:
+        """Confirm creating a new library."""
+        name = name_input.text().strip()
+        zh = self.state.language == 'zh'
+
+        # Use default name if empty
+        if not name:
+            base_name = "新建账号库" if zh else "New Library"
+            name = base_name
+            counter = 1
+            libraries = self.library_service.list_libraries()
+            existing_names = {lib.name for lib in libraries}
+            while name in existing_names:
+                counter += 1
+                name = f"{base_name} ({counter})"
+        else:
+            # Check for duplicate name
+            libraries = self.library_service.list_libraries()
+            if any(lib.name == name for lib in libraries):
+                self.toast.show_message("账号库名称已存在" if zh else "Library name already exists")
+                return
+
+        new_lib = self.library_service.create_library(name)
+        self._refresh_library_panel()
+        self.toast.show_message(f"已创建「{name}」" if zh else f"Created '{name}'")
+
+    def _show_delete_confirmation(self, message: str) -> bool:
+        """Show styled delete confirmation dialog matching library panel colors.
+
+        Returns True if user confirms, False otherwise.
+        """
+        t = get_theme()
+        is_dark = get_theme_manager().is_dark
+        zh = self.state.language == 'zh'
+
+        # Dark mode: use colors matching library panel (softer grays)
+        # Light mode: use standard theme colors
+        dialog_bg = "#374151" if is_dark else t.bg_primary
+        text_color = "#F3F4F6" if is_dark else t.text_primary
+        cancel_bg = "#4B5563" if is_dark else t.bg_tertiary
+        cancel_hover = "#6B7280" if is_dark else t.bg_hover
+        error_color = "#DC2626" if is_dark else t.error
+        error_hover = "#B91C1C" if is_dark else "#DC2626"
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("确认删除" if zh else "Confirm Delete")
+        dialog.setFixedWidth(320)
+        dialog.setStyleSheet(f"""
+            QDialog {{
+                background-color: {dialog_bg};
+                border-radius: 8px;
+            }}
+            QLabel {{
+                color: {text_color};
+                font-size: 13px;
+            }}
+            QPushButton {{
+                padding: 8px 16px;
+                border-radius: 6px;
+                font-size: 13px;
+                font-weight: 500;
+            }}
+        """)
+
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setSpacing(16)
+
+        label = QLabel(message)
+        label.setWordWrap(True)
+        layout.addWidget(label)
+
+        btn_layout = QHBoxLayout()
+        btn_layout.setSpacing(8)
+
+        cancel_btn = QPushButton("取消" if zh else "Cancel")
+        cancel_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {cancel_bg};
+                border: none;
+                color: {text_color};
+            }}
+            QPushButton:hover {{
+                background-color: {cancel_hover};
+            }}
+        """)
+        cancel_btn.clicked.connect(dialog.reject)
+        btn_layout.addWidget(cancel_btn)
+
+        delete_btn = QPushButton("删除" if zh else "Delete")
+        delete_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {error_color};
+                border: none;
+                color: white;
+            }}
+            QPushButton:hover {{
+                background-color: {error_hover};
+            }}
+        """)
+        delete_btn.clicked.connect(dialog.accept)
+        btn_layout.addWidget(delete_btn)
+
+        layout.addLayout(btn_layout)
+
+        return dialog.exec() == QDialog.DialogCode.Accepted
+
+    def _confirm_delete_library(self, lib) -> None:
+        """Show styled delete confirmation."""
+        t = get_theme()
+        is_dark = get_theme_manager().is_dark
+        zh = self.state.language == 'zh'
+
+        # Get account count for this library
+        if lib.id == self.library_service.get_current_library().id:
+            account_count = len(self.state.accounts)
+        else:
+            state = self.library_service.load_library_state(lib)
+            account_count = len(state.accounts)
+
+        # Dark mode: use colors matching library panel (softer grays)
+        # Light mode: use standard theme colors
+        dialog_bg = "#374151" if is_dark else t.bg_primary
+        text_color = "#F3F4F6" if is_dark else t.text_primary
+        cancel_bg = "#4B5563" if is_dark else t.bg_tertiary
+        cancel_hover = "#6B7280" if is_dark else t.bg_hover
+        error_color = "#DC2626" if is_dark else t.error
+        error_hover = "#B91C1C" if is_dark else "#DC2626"
+
+        # Create styled dialog
+        dialog = QDialog(self)
+        dialog.setWindowTitle("确认删除" if zh else "Confirm Delete")
+        dialog.setFixedWidth(320)
+        dialog.setStyleSheet(f"""
+            QDialog {{
+                background-color: {dialog_bg};
+                border-radius: 8px;
+            }}
+            QLabel {{
+                color: {text_color};
+                font-size: 13px;
+            }}
+            QPushButton {{
+                padding: 8px 16px;
+                border-radius: 6px;
+                font-size: 13px;
+                font-weight: 500;
+            }}
+        """)
+
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setSpacing(16)
+
+        # Message
+        msg = f"确定要删除账号库「{lib.name}」吗？" if zh else f"Delete library '{lib.name}'?"
+        if account_count > 0:
+            msg += f"\n\n{account_count} 个账户将被永久删除" if zh else f"\n\n{account_count} accounts will be permanently deleted"
+
+        label = QLabel(msg)
+        label.setWordWrap(True)
+        layout.addWidget(label)
+
+        # Buttons
+        btn_layout = QHBoxLayout()
+        btn_layout.setSpacing(8)
+
+        cancel_btn = QPushButton("取消" if zh else "Cancel")
+        cancel_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {cancel_bg};
+                border: none;
+                color: {text_color};
+            }}
+            QPushButton:hover {{
+                background-color: {cancel_hover};
+            }}
+        """)
+        cancel_btn.clicked.connect(dialog.reject)
+        btn_layout.addWidget(cancel_btn)
+
+        delete_btn = QPushButton("删除" if zh else "Delete")
+        delete_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {error_color};
+                border: none;
+                color: white;
+            }}
+            QPushButton:hover {{
+                background-color: {error_hover};
+            }}
+        """)
+        delete_btn.clicked.connect(dialog.accept)
+        btn_layout.addWidget(delete_btn)
+
+        layout.addLayout(btn_layout)
+
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self._delete_library(lib)
+
+    def _switch_library(self, library_id: str) -> None:
+        """Switch to a different library."""
+        # Exit multi-select mode when switching libraries
+        self._exit_multi_select_mode()
+
         self._save_data()
+        new_lib = self.library_service.switch_library(library_id)
+        self.state = self.library_service.load_library_state(new_lib)
+        self._update_icons()
+        self._refresh_groups()
+        self._refresh_account_list()
+        self.selected_account = None
+        self._update_detail_panel()
 
-    def _update_language_button(self) -> None:
-        """Update language button text."""
-        if self.state.language == 'en':
-            self.btn_language.setText("EN → 中")
-            self.btn_language.setToolTip("Click to switch to Chinese")
-        else:
-            self.btn_language.setText("中 → EN")
-            self.btn_language.setToolTip("点击切换到英文")
+    def _create_new_library_direct(self) -> None:
+        """Create a new library with default name."""
+        zh = self.state.language == 'zh'
+        # Generate default name like "新建账号库", "新建账号库 (2)", etc.
+        base_name = "新建账号库" if zh else "New Library"
+        libraries = self.library_service.list_libraries()
+        existing_names = [lib.name for lib in libraries]
 
-    def _update_ui_language(self) -> None:
-        """Update all UI elements with current language."""
-        self.setWindowTitle(self.tr('window_title'))
-        suffix = self.tr('window_title').replace('G-Account Manager', 'Account Manager').replace('谷歌账号管家', '账号管家')
-        self.title_label.setText(" " + suffix)
-        self.format_hint.setText(self.tr('format_hint'))
-        self.btn_toggle_import.setText(
-            "▼ " + self.tr('collapse_import') if self.import_content.isVisible()
-            else "▶ " + self.tr('expand_import')
+        name = base_name
+        counter = 2
+        while name in existing_names:
+            name = f"{base_name} ({counter})"
+            counter += 1
+
+        new_lib = self.library_service.create_library(name)
+        self._switch_library(new_lib.id)
+
+        self.toast.show_message(f"已创建「{name}」" if zh else f"Created '{name}'")
+
+    def _delete_library(self, lib) -> None:
+        """Delete a library with undo support."""
+        zh = self.state.language == 'zh'
+        libraries = self.library_service.list_libraries()
+        current = self.library_service.get_current_library()
+
+        # If deleting current library, switch first
+        if lib.id == current.id:
+            other_lib = next(l for l in libraries if l.id != lib.id)
+            self._switch_library(other_lib.id)
+
+        # Delete but keep file for undo
+        backup_data = self.library_service.delete_library(lib.id, keep_file=True)
+        self._refresh_library_panel()
+
+        # Store backup for permanent deletion on timeout
+        self._pending_delete_backup = backup_data
+        lib_name = lib.name
+
+        def undo_delete():
+            """Undo the library deletion."""
+            if self._pending_delete_backup:
+                restored = self.library_service.restore_library(self._pending_delete_backup)
+                self._pending_delete_backup = None
+                self._refresh_library_panel()
+                self.toast.show_message(f"已恢复「{lib_name}」" if zh else f"Restored '{lib_name}'")
+
+        def on_timeout():
+            """Permanently delete after timeout."""
+            if self._pending_delete_backup:
+                self.library_service.permanently_delete_library_file(self._pending_delete_backup)
+                self._pending_delete_backup = None
+
+        # Override toast timeout handler
+        original_timeout = self.toast._on_timeout
+        def custom_timeout():
+            on_timeout()
+            original_timeout()
+        self.toast._on_timeout = custom_timeout
+
+        # Show toast with undo option
+        self.toast.show_message(
+            f"已删除「{lib_name}」" if zh else f"Deleted '{lib_name}'",
+            duration=5000,
+            action_text="撤销" if zh else "Undo",
+            action_callback=undo_delete
         )
-        self.text_input.setPlaceholderText(self.tr('paste_placeholder'))
-        self.btn_add_line.setText(self.tr('add_account'))
-        self.btn_import.setText(self.tr('import_file'))
-        self.btn_clear.setText(self.tr('clear_all'))
-        self._update_language_button()
-        self.btn_add_group.setToolTip(self.tr('add_group'))
-        self.table.setHorizontalHeaderLabels([
-            '', self.tr('id'), self.tr('email'), self.tr('password'),
-            self.tr('secondary_email'), self.tr('2fa_key'), self.tr('2fa_code'),
-            self.tr('import_time'), self.tr('groups'), self.tr('notes')
-        ])
-        self.count_label.setText(f"{self.tr('accounts')}: {self.table.rowCount()}")
-        self.copy_hint_label.setText(self.tr('click_to_copy'))
-        self.btn_batch_add_group.setText(self.tr('batch_add_group'))
-        self.btn_batch_remove_group.setText(self.tr('batch_remove_group'))
-        self.btn_batch_delete.setText(self.tr('batch_delete'))
-        self.group_label.setText(self.tr('groups'))
-        self._refresh_group_list()
 
-    def _toggle_import_section(self) -> None:
-        """Toggle import section visibility."""
-        if self.import_content.isVisible():
-            self.import_content.hide()
-            self.btn_toggle_import.setText("▶ " + self.tr('expand_import'))
-        else:
-            self.import_content.show()
-            self.btn_toggle_import.setText("▼ " + self.tr('collapse_import'))
+    def _start_new_library(self) -> None:
+        """Start creating a new library - show editable card."""
+        self._creating_new_library = True
+        self._refresh_library_panel()
 
-    def _toggle_sidebar(self) -> None:
-        """Toggle sidebar collapsed state."""
-        self.sidebar_collapsed = not self.sidebar_collapsed
+    def _reorder_library(self, library_id: str, direction: int) -> None:
+        """Reorder a library up or down."""
+        self.library_service.reorder_library(library_id, direction)
+        self._refresh_library_panel()
 
-        if self.sidebar_collapsed:
-            self.content_splitter.setSizes([36, 900])
-            self.btn_collapse_sidebar.setIcon(QIcon(create_arrow_icon('right', 16, '#787774')))
-            self.btn_collapse_sidebar.setToolTip(self.tr('expand_sidebar'))
-            self.group_label.hide()
-            self.btn_add_group.hide()
-        else:
-            self.content_splitter.setSizes([180, 900])
-            self.btn_collapse_sidebar.setIcon(QIcon(create_arrow_icon('left', 16, '#787774')))
-            self.btn_collapse_sidebar.setToolTip(self.tr('collapse_sidebar'))
-            self.group_label.show()
-            self.btn_add_group.show()
-
-        self._refresh_group_list()
-
-    def _toggle_info_display(self) -> None:
-        """Toggle between masked and full info display."""
-        self.show_full_info = not self.show_full_info
-        if self.show_full_info:
-            self.btn_toggle_info.setText(self.tr('hide_full'))
-            self.btn_toggle_info.setIcon(QIcon(create_lock_icon(True, 16)))
-        else:
-            self.btn_toggle_info.setText(self.tr('show_full'))
-            self.btn_toggle_info.setIcon(QIcon(create_lock_icon(False, 16)))
-        self._refresh_table_display()
-
-    # ========== Data Operations ==========
-
-    def _save_data(self) -> None:
-        """Save current state to file."""
-        self.data_service.save(self.state)
-
-    def _add_from_text_input(self) -> None:
-        """Add accounts from text input."""
-        text = self.text_input.toPlainText().strip()
-        if not text:
-            QMessageBox.warning(self, self.tr('empty_input'), self.tr('empty_input_msg'))
-            return
-
-        accounts = self.import_service.parse_text(text)
-        self._process_import(accounts)
-        self.text_input.clear()
-
-    def _import_from_file(self) -> None:
-        """Import accounts from file."""
-        file_path, _ = QFileDialog.getOpenFileName(
-            self, self.tr('import_file'), "",
-            "Text Files (*.txt);;All Files (*)"
-        )
-        if not file_path:
-            return
-
-        try:
-            accounts = self.import_service.parse_file(file_path)
-            self._process_import(accounts)
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"Failed to import: {e}")
-
-    def _process_import(self, new_accounts: list[Account]) -> None:
-        """Process imported accounts, handling duplicates."""
-        if not new_accounts:
-            return
-
-        # Create backup
-        self.backup_service.create_backup()
-
-        # Find duplicates
-        duplicates = self.account_service.find_duplicates(new_accounts)
-
-        # Handle conflicts
-        replace_indices = set()
-        if duplicates:
-            # Convert to dict format for dialog
-            conflicts = [
-                (new_acc.to_dict(), existing.to_dict(), idx)
-                for new_acc, existing, idx in duplicates
-            ]
-            dialog = DuplicateConflictDialog(conflicts, self.state.language, self)
-            if dialog.exec() == QDialog.DialogCode.Accepted:
-                choices = dialog.get_choices()
-                for i, choice in choices.items():
-                    if choice == 'replace':
-                        replace_indices.add(i)
-
-        # Process accounts
-        added = 0
-        replaced = 0
-        duplicate_emails = {d[0].email_normalized for d in duplicates}
-
-        for account in new_accounts:
-            if account.email_normalized in duplicate_emails:
-                # Check if we should replace
-                for i, (new_acc, existing, idx) in enumerate(duplicates):
-                    if new_acc.email_normalized == account.email_normalized:
-                        if i in replace_indices:
-                            # Replace existing
-                            account.id = existing.id
-                            self.state.accounts[idx] = account
-                            replaced += 1
-                        break
-            else:
-                # Add new account
-                self.account_service.add(account)
-                added += 1
-
-        self._save_data()
-        self._load_accounts_to_table()
-        self._refresh_group_list()
-
-        # Show result
-        msg_parts = []
-        if added > 0:
-            msg_parts.append(self.tr('added_new').format(added))
-        if replaced > 0:
-            msg_parts.append(self.tr('replaced_existing').format(replaced))
-        if msg_parts:
-            self.toast.show_message(", ".join(msg_parts), self)
-
-    def _clear_accounts(self) -> None:
-        """Clear all accounts (move to trash)."""
-        if not self.state.accounts:
-            return
-
-        count = len(self.state.accounts)
-        reply = QMessageBox.question(
-            self, self.tr('confirm_clear'),
-            self.tr('confirm_clear_msg').format(count),
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
-        )
-        if reply == QMessageBox.StandardButton.Yes:
-            self.backup_service.create_backup()
-            self.account_service.clear_all(move_to_trash=True)
+    def _show_trash_dialog(self) -> None:
+        """Show trash management dialog."""
+        dialog = TrashDialog(self, self.state, self.state.language)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            # Refresh if any changes were made
             self._save_data()
-            self._load_accounts_to_table()
-            self._refresh_group_list()
+            self._refresh_groups()
+            self._refresh_account_list()
+            self._update_ui_text()  # Update trash count
 
-    # ========== Table Operations ==========
+    def _show_archive_dialog(self) -> None:
+        """Show archive management dialog."""
+        dialog = ArchiveDialog(self, self.state.language)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            archive = dialog.get_selected_archive()
+            if archive:
+                self._restore_archive(archive)
 
-    def _load_accounts_to_table(self) -> None:
-        """Load all accounts into the table."""
-        self.table.blockSignals(True)
-        self.table.setRowCount(0)
+    def _restore_archive(self, archive: ArchiveInfo) -> None:
+        """Restore application state from archive."""
+        try:
+            self.state = self.archive_service.restore_archive(archive)
+            current = self.library_service.get_current_library()
+            self.library_service.save_library_state(current, self.state)
+            self._refresh_groups()
+            self._refresh_account_list()
+            self.selected_account = None
+            self._update_detail_panel()
 
-        for i, account in enumerate(self.state.accounts):
-            self._add_account_row(account, i)
+            zh = self.state.language == 'zh'
+            self.toast.show_message("已恢复存档" if zh else "Archive restored")
+        except Exception as e:
+            logger.error(f"Failed to restore archive: {e}")
 
-        self.table.blockSignals(False)
-        self._calculate_column_widths()
-        self._filter_table()
+    def _toggle_group_edit_mode(self) -> None:
+        """Toggle group editing mode."""
+        self.group_edit_mode = not self.group_edit_mode
+        zh = self.state.language == 'zh'
 
-    def _add_account_row(self, account: Account, index: int) -> None:
-        """Add a single account row to the table."""
-        row = self.table.rowCount()
-        self.table.insertRow(row)
+        if self.group_edit_mode:
+            self.btn_edit_groups.setText("完成" if zh else "Done")
+        else:
+            self.btn_edit_groups.setText("编辑" if zh else "Edit")
+            self._save_data()  # Save changes when exiting edit mode
 
-        # Checkbox
-        checkbox_widget = QWidget()
-        checkbox_layout = QHBoxLayout(checkbox_widget)
-        checkbox_layout.setContentsMargins(0, 0, 0, 0)
-        checkbox_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        checkbox = QCheckBox()
-        checkbox.setStyleSheet(f"""
-            QCheckBox::indicator {{
-                width: 18px;
-                height: 18px;
-                border: 2px solid #CBD5E1;
-                border-radius: 4px;
-                background-color: #FFFFFF;
+        self._refresh_groups()
+
+    def _refresh_groups(self) -> None:
+        """Refresh groups list with colored dot indicators or editable items."""
+        for btn in self.group_buttons:
+            btn.deleteLater()
+        self.group_buttons.clear()
+
+        zh = self.state.language == 'zh'
+        is_dark = get_theme_manager().is_dark
+
+        if self.group_edit_mode:
+            # Edit mode - keep "All Accounts" visible but non-editable
+            all_count = len(self.state.accounts)
+            all_label = "全部账户" if zh else "All Accounts"
+            all_btn = GroupButton(all_label, all_count, is_all=True)
+            all_btn.setEnabled(False)  # Disabled in edit mode
+            self.groups_layout.insertWidget(0, all_btn)
+            self.group_buttons.append(all_btn)
+
+            # Editable group items
+            for i, group in enumerate(self.state.groups):
+                item = EditableGroupItem(group, is_dark=is_dark)
+                item.deleted.connect(self._on_group_deleted)
+                item.name_changed.connect(self._on_group_renamed)
+                item.dropped.connect(self._on_group_reorder)
+                self.groups_layout.insertWidget(i + 1, item)
+                self.group_buttons.append(item)
+
+            # Add "Add Group" button at the end
+            add_btn = AddGroupButton(self.state.language)
+            add_btn.clicked.connect(self._on_add_group)
+            self.groups_layout.insertWidget(len(self.state.groups) + 1, add_btn)
+            self.group_buttons.append(add_btn)
+        else:
+            # Normal mode - show navigation buttons
+            # All accounts button (with icon)
+            all_count = len(self.state.accounts)
+            all_label = "全部账户" if zh else "All Accounts"
+            all_btn = GroupButton(all_label, all_count, is_all=True)
+            all_btn.setProperty("group_id", None)
+            all_btn.clicked.connect(lambda: self._on_group_clicked(None))
+            self.groups_layout.insertWidget(0, all_btn)
+            self.group_buttons.append(all_btn)
+
+            # User groups (with colored dots)
+            for i, group in enumerate(self.state.groups):
+                count = len([a for a in self.state.accounts if group.name in a.groups])
+                color = group.get_color_for_theme(is_dark)
+                btn = GroupButton(group.name, count, color_hex=color)
+                btn.setProperty("group_id", group.name)
+                btn.clicked.connect(lambda gid=group.name: self._on_group_clicked(gid))
+                btn.rightClicked.connect(lambda pos, gname=group.name: self._on_group_right_clicked(gname, pos))
+                self.groups_layout.insertWidget(i + 1, btn)
+                self.group_buttons.append(btn)
+
+            self._highlight_selected_group()
+
+    def _on_group_deleted(self, group_name: str) -> None:
+        """Handle group deletion with confirmation and undo."""
+        zh = self.state.language == 'zh'
+        t = get_theme()
+        is_dark = get_theme_manager().is_dark
+
+        # Count accounts using this group
+        count = sum(1 for acc in self.state.accounts if group_name in acc.groups)
+
+        # Create styled confirmation dialog
+        dialog = QDialog(self)
+        dialog.setWindowTitle("确认删除" if zh else "Confirm Delete")
+        dialog.setFixedWidth(320)
+
+        # Darker colors for dark mode
+        error_color = "#DC2626" if is_dark else t.error
+        error_hover = "#B91C1C" if is_dark else "#DC2626"
+
+        dialog.setStyleSheet(f"""
+            QDialog {{
+                background-color: {t.bg_primary};
             }}
-            QCheckBox::indicator:hover {{
-                border-color: #3B82F6;
-                background-color: #EFF6FF;
+            QLabel {{
+                color: {t.text_primary};
+                font-size: 13px;
             }}
-            QCheckBox::indicator:checked {{
-                background-color: #3B82F6;
-                border-color: #3B82F6;
-                image: url({CHECK_SVG_PATH});
-            }}
-            QCheckBox::indicator:checked:hover {{
-                background-color: #2563EB;
-                border-color: #2563EB;
+            QPushButton {{
+                padding: 8px 16px;
+                border-radius: 6px;
+                font-size: 13px;
+                font-weight: 500;
             }}
         """)
-        checkbox.clicked.connect(lambda checked, r=row: self._on_checkbox_clicked(r, checked))
-        checkbox_layout.addWidget(checkbox)
-        self.table.setCellWidget(row, 0, checkbox_widget)
 
-        # ID
-        id_item = QTableWidgetItem(str(account.id or ""))
-        id_item.setFont(QFont("Microsoft YaHei UI", 10, QFont.Weight.Bold))
-        id_item.setData(Qt.ItemDataRole.UserRole + 1, index)
-        id_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-        id_item.setFlags(id_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-        self.table.setItem(row, 1, id_item)
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setSpacing(16)
 
-        # Email (not editable)
-        email_display = account.email if self.show_full_info else self._mask_text(account.email, 4)
-        email_item = QTableWidgetItem(email_display)
-        email_item.setData(Qt.ItemDataRole.UserRole, account.email)
-        email_item.setFlags(email_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-        self.table.setItem(row, 2, email_item)
+        # Message
+        msg = f"确定要删除分组「{group_name}」吗？" if zh else f"Delete group '{group_name}'?"
+        if count > 0:
+            msg += f"\n\n⚠ {count} 个账户正在使用此分组" if zh else f"\n\n⚠ {count} accounts use this group"
 
-        # Password (not editable)
-        pwd_display = account.password if self.show_full_info else self._mask_text(account.password, 2)
-        pwd_item = QTableWidgetItem(pwd_display)
-        pwd_item.setData(Qt.ItemDataRole.UserRole, account.password)
-        pwd_item.setFlags(pwd_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-        self.table.setItem(row, 3, pwd_item)
+        label = QLabel(msg)
+        label.setWordWrap(True)
+        layout.addWidget(label)
 
-        # Backup email (not editable)
-        backup_display = account.backup if self.show_full_info else self._mask_text(account.backup, 4)
-        backup_item = QTableWidgetItem(backup_display)
-        backup_item.setData(Qt.ItemDataRole.UserRole, account.backup)
-        backup_item.setFlags(backup_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-        self.table.setItem(row, 4, backup_item)
+        # Buttons
+        btn_layout = QHBoxLayout()
+        btn_layout.setSpacing(8)
 
-        # 2FA Key (not editable)
-        if self.show_full_info:
-            secret_display = account.secret if account.secret else "(none)"
-        else:
-            if account.secret:
-                s = account.secret
-                secret_display = s[:6] + "..." + s[-4:] if len(s) > 10 else s
-            else:
-                secret_display = "(none)"
-        secret_item = QTableWidgetItem(secret_display)
-        secret_item.setData(Qt.ItemDataRole.UserRole, account.secret)
-        secret_item.setFlags(secret_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-        self.table.setItem(row, 5, secret_item)
+        cancel_btn = QPushButton("取消" if zh else "Cancel")
+        cancel_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {t.bg_tertiary};
+                border: none;
+                color: {t.text_primary};
+            }}
+            QPushButton:hover {{
+                background-color: {t.bg_hover};
+            }}
+        """)
+        cancel_btn.clicked.connect(dialog.reject)
+        btn_layout.addWidget(cancel_btn)
 
-        # 2FA Code
-        if account.secret:
-            code = self.totp_service.generate_code_safe(account.secret)
-            if code:
-                code_item = QTableWidgetItem(code)
-                code_item.setFont(QFont("Consolas", 14, QFont.Weight.Bold))
-                code_item.setForeground(QColor("#2563EB"))
-            else:
-                code_item = QTableWidgetItem("ERROR")
-                code_item.setForeground(QColor("#EF4444"))
-        else:
-            code_item = QTableWidgetItem("-")
-            code_item.setForeground(QColor("#9CA3AF"))
-        code_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-        code_item.setFlags(code_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-        self.table.setItem(row, 6, code_item)
+        delete_btn = QPushButton("删除" if zh else "Delete")
+        delete_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {error_color};
+                border: none;
+                color: white;
+            }}
+            QPushButton:hover {{
+                background-color: {error_hover};
+            }}
+        """)
+        delete_btn.clicked.connect(dialog.accept)
+        btn_layout.addWidget(delete_btn)
 
-        # Import time (not editable)
-        time_item = QTableWidgetItem(account.import_time)
-        time_item.setForeground(QColor("#6B7280"))
-        time_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-        time_item.setFlags(time_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-        self.table.setItem(row, 7, time_item)
+        layout.addLayout(btn_layout)
 
-        # Groups (as tags widget)
-        self._update_tags_cell(row, index)
-
-        # Notes (editable)
-        notes_item = QTableWidgetItem(account.notes)
-        notes_item.setForeground(QColor("#6B7280"))
-        notes_item.setFlags(notes_item.flags() | Qt.ItemFlag.ItemIsEditable)
-        self.table.setItem(row, 9, notes_item)
-
-    def _mask_text(self, text: str, visible_chars: int = 2) -> str:
-        """Mask text for privacy, showing first visible_chars characters."""
-        if not text:
-            return ""
-        if len(text) <= visible_chars:
-            return "*" * len(text)
-        return text[:visible_chars] + "*" * (len(text) - visible_chars)
-
-    def _update_tags_cell(self, row: int, account_idx: int) -> None:
-        """Update the tags cell for a row."""
-        if account_idx >= len(self.state.accounts):
+        if dialog.exec() != QDialog.DialogCode.Accepted:
             return
 
-        account = self.state.accounts[account_idx]
-        tags_widget = QWidget()
-        tags_widget.setStyleSheet("background-color: #FFFFFF;")
-        tags_layout = QHBoxLayout(tags_widget)
-        tags_layout.setContentsMargins(4, 0, 4, 0)
-        tags_layout.setSpacing(2)
-        tags_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        # Backup for undo
+        deleted_group = next((g for g in self.state.groups if g.name == group_name), None)
+        affected_accounts = [(acc.id, list(acc.groups)) for acc in self.state.accounts if group_name in acc.groups]
+        group_index = next((i for i, g in enumerate(self.state.groups) if g.name == group_name), 0)
 
-        tooltip_parts = []
-        for group_name in account.groups:
-            group = self.state.get_group_by_name(group_name)
-            if group:
-                color_hex = group.color_hex
-                pastel_fill = get_pastel_color(color_hex)
-                dot_label = QLabel()
-                dot_label.setFixedSize(14, 14)
-                dot_label.setStyleSheet(f"background-color: {pastel_fill}; border: 1px solid #9CA3AF; border-radius: 3px;")
-                tags_layout.addWidget(dot_label)
-                tooltip_parts.append(f"■ {group_name}")
+        # Remove group from state
+        self.state.groups = [g for g in self.state.groups if g.name != group_name]
+        # Remove group from all accounts
+        for account in self.state.accounts:
+            if group_name in account.groups:
+                account.groups.remove(group_name)
+        # Reset selection if deleted group was selected
+        if self.selected_group == group_name:
+            self.selected_group = None
+        self._refresh_groups()
+        self._refresh_account_list()
 
-        if tooltip_parts:
-            tags_widget.setToolTip('\n'.join(tooltip_parts))
-        self.table.setCellWidget(row, 8, tags_widget)
+        def undo_delete():
+            """Undo the group deletion."""
+            if deleted_group:
+                # Restore group at original position
+                self.state.groups.insert(group_index, deleted_group)
+                # Restore group to affected accounts
+                for acc_id, original_groups in affected_accounts:
+                    acc = next((a for a in self.state.accounts if a.id == acc_id), None)
+                    if acc:
+                        acc.groups = original_groups
+                self._refresh_groups()
+                self._refresh_account_list()
+                self._update_detail_panel()
+                self.toast.show_message(f"已恢复「{group_name}」" if zh else f"Restored '{group_name}'")
 
-    def _calculate_column_widths(self) -> None:
-        """Calculate email and password column widths."""
-        if not self.state.accounts:
-            self.table.setColumnWidth(2, 200)
-            self.table.setColumnWidth(3, 120)
-            return
+        # Show toast with undo option
+        self.toast.show_message(
+            f"已删除「{group_name}」" if zh else f"Deleted '{group_name}'",
+            duration=5000,
+            action_text="撤销" if zh else "Undo",
+            action_callback=undo_delete
+        )
 
-        fm = QFontMetrics(self.table.font())
-        max_email = max(fm.horizontalAdvance(acc.email) for acc in self.state.accounts)
-        max_pwd = max(fm.horizontalAdvance(acc.password) for acc in self.state.accounts)
+    def _on_group_renamed(self, old_name: str, new_name: str) -> None:
+        """Handle group rename."""
+        # Check if new name already exists
+        if any(g.name == new_name for g in self.state.groups):
+            return  # Name already exists, don't rename
 
-        self.table.setColumnWidth(2, max(max_email + 25, 150))
-        self.table.setColumnWidth(3, max(max_pwd + 25, 100))
-
-    def _refresh_table_display(self) -> None:
-        """Refresh table display (for mask/unmask toggle)."""
-        self.table.blockSignals(True)
-        for row in range(self.table.rowCount()):
-            id_item = self.table.item(row, 1)
-            if not id_item:
-                continue
-            account_idx = id_item.data(Qt.ItemDataRole.UserRole + 1)
-            if account_idx is None or account_idx >= len(self.state.accounts):
-                continue
-            account = self.state.accounts[account_idx]
-
-            # Update display
-            email_item = self.table.item(row, 2)
-            if email_item:
-                display = account.email if self.show_full_info else self._mask_text(account.email, 4)
-                email_item.setText(display)
-
-            pwd_item = self.table.item(row, 3)
-            if pwd_item:
-                display = account.password if self.show_full_info else self._mask_text(account.password)
-                pwd_item.setText(display)
-
-            backup_item = self.table.item(row, 4)
-            if backup_item:
-                display = account.backup if self.show_full_info else self._mask_text(account.backup)
-                backup_item.setText(display)
-
-            secret_item = self.table.item(row, 5)
-            if secret_item:
-                display = account.secret if self.show_full_info else self._mask_text(account.secret)
-                secret_item.setText(display)
-
-        self.table.blockSignals(False)
-
-    def _filter_table(self) -> None:
-        """Filter table based on selected group."""
-        current_filter = self.state.current_filter
-        for row in range(self.table.rowCount()):
-            id_item = self.table.item(row, 1)
-            if not id_item:
-                continue
-            account_idx = id_item.data(Qt.ItemDataRole.UserRole + 1)
-            if account_idx is None or account_idx >= len(self.state.accounts):
-                continue
-            account = self.state.accounts[account_idx]
-
-            show = False
-            if current_filter == 'all':
-                show = True
-            elif current_filter == 'ungrouped':
-                show = account.is_ungrouped
-            elif current_filter == 'trash':
-                show = False
-            else:
-                show = account.is_in_group(current_filter)
-
-            self.table.setRowHidden(row, not show)
-
-        visible = sum(1 for row in range(self.table.rowCount()) if not self.table.isRowHidden(row))
-        self.count_label.setText(f"{self.tr('accounts')}: {visible}")
-
-    def _refresh_group_list(self) -> None:
-        """Refresh the sidebar group list."""
-        self.group_list.clear()
-
-        all_count = len(self.state.accounts)
-        ungrouped_count = len(self.state.get_ungrouped_accounts())
-        trash_count = len(self.state.trash)
-        collapsed = self.sidebar_collapsed
-
-        # All accounts
-        all_item = QListWidgetItem() if collapsed else QListWidgetItem(f"  {self.tr('all_accounts')} ({all_count})")
-        all_item.setIcon(QIcon(create_list_icon(16)))
-        all_item.setData(Qt.ItemDataRole.UserRole, 'all')
-        self.group_list.addItem(all_item)
-
-        # Ungrouped
-        ungrouped_item = QListWidgetItem() if collapsed else QListWidgetItem(f"  {self.tr('ungrouped')} ({ungrouped_count})")
-        ungrouped_item.setIcon(QIcon(create_folder_icon(16)))
-        ungrouped_item.setData(Qt.ItemDataRole.UserRole, 'ungrouped')
-        self.group_list.addItem(ungrouped_item)
-
-        # Custom groups
+        # Update group name
         for group in self.state.groups:
-            count = len(self.state.get_accounts_in_group(group.name))
-            item = QListWidgetItem() if collapsed else QListWidgetItem(f"  {group.name} ({count})")
-            item.setIcon(QIcon(create_dot_icon(group.color_hex, 10)))
-            item.setData(Qt.ItemDataRole.UserRole, group.name)
-            self.group_list.addItem(item)
-
-        # Trash
-        trash_item = QListWidgetItem() if collapsed else QListWidgetItem(f"  {self.tr('trash_bin')} ({trash_count})")
-        trash_item.setIcon(QIcon(create_trash_icon(16)))
-        trash_item.setData(Qt.ItemDataRole.UserRole, 'trash')
-        self.group_list.addItem(trash_item)
-
-        # Select current filter
-        for i in range(self.group_list.count()):
-            item = self.group_list.item(i)
-            if item.data(Qt.ItemDataRole.UserRole) == self.state.current_filter:
-                self.group_list.setCurrentItem(item)
+            if group.name == old_name:
+                group.name = new_name
                 break
 
-    def _on_group_selected(self, item: QListWidgetItem) -> None:
-        """Handle group selection."""
-        selected = item.data(Qt.ItemDataRole.UserRole)
-        if selected == 'trash':
-            self._show_trash()
-            # Re-select current filter
-            for i in range(self.group_list.count()):
-                it = self.group_list.item(i)
-                if it.data(Qt.ItemDataRole.UserRole) == self.state.current_filter:
-                    self.group_list.setCurrentItem(it)
-                    break
-        else:
-            self.state.current_filter = selected
-            self._filter_table()
+        # Update all accounts
+        for account in self.state.accounts:
+            if old_name in account.groups:
+                account.groups.remove(old_name)
+                account.groups.append(new_name)
 
-    def _update_display(self) -> None:
-        """Update countdown and 2FA codes."""
-        remaining = self.totp_service.get_remaining_seconds()
-        self.countdown_label.setText(f"{self.tr('code_expires')} {remaining}s")
-        self.progress_bar.setValue(remaining)
+        # Update selection if renamed group was selected
+        if self.selected_group == old_name:
+            self.selected_group = new_name
 
-        # Update color based on time
-        if remaining <= 5:
-            color = "#EF4444"  # Red
-        elif remaining <= 10:
-            color = "#F59E0B"  # Orange
-        else:
-            color = "#10B981"  # Green
+    def _on_group_reorder(self, dragged_item: 'EditableGroupItem', target_item: 'EditableGroupItem') -> None:
+        """Handle group reordering via drag and drop."""
+        dragged_name = dragged_item.group.name
+        target_name = target_item.group.name
 
-        self.countdown_label.setStyleSheet(f"color: {color}; font-weight: bold;")
-        self.progress_bar.setStyleSheet(f"""
-            QProgressBar {{ background-color: #E5E7EB; border-radius: 3px; border: none; }}
-            QProgressBar::chunk {{ background-color: {color}; border-radius: 3px; }}
-        """)
-        self.clock_icon_label.setPixmap(create_clock_icon(14, color))
+        # Find indices
+        dragged_idx = next((i for i, g in enumerate(self.state.groups) if g.name == dragged_name), None)
+        target_idx = next((i for i, g in enumerate(self.state.groups) if g.name == target_name), None)
 
-        # Refresh codes when needed
-        if remaining >= 29:
-            self._refresh_codes()
+        if dragged_idx is not None and target_idx is not None and dragged_idx != target_idx:
+            # Remove from old position
+            group = self.state.groups.pop(dragged_idx)
 
-    def _refresh_codes(self) -> None:
-        """Refresh all 2FA codes in the table."""
-        self.table.blockSignals(True)
-        for row in range(self.table.rowCount()):
-            id_item = self.table.item(row, 1)
-            if not id_item:
-                continue
-            account_idx = id_item.data(Qt.ItemDataRole.UserRole + 1)
-            if account_idx is None or account_idx >= len(self.state.accounts):
-                continue
-            account = self.state.accounts[account_idx]
+            # Adjust target index after removal
+            if dragged_idx < target_idx:
+                target_idx -= 1
 
-            code_item = self.table.item(row, 6)
-            if code_item and account.secret:
-                code = self.totp_service.generate_code_safe(account.secret) or ""
-                code_item.setText(code)
-        self.table.blockSignals(False)
-
-    def _on_cell_clicked(self, row: int, col: int) -> None:
-        """Handle cell click to copy content, or edit notes/tags."""
-        # Don't copy: Checkbox(0), ID(1), Import Time(7)
-        if col in [0, 1, 7]:
-            return
-
-        # Show tag popup (column 8)
-        if col == 8:
-            self._show_tag_popup(row)
-            return
-
-        # Edit notes directly in cell on click (column 9)
-        if col == 9:
-            item = self.table.item(row, col)
-            if item:
-                self.table.editItem(item)
-            return
-
-        item = self.table.item(row, col)
-        if item:
-            # Get original (unmasked) value from UserRole for columns 2-5
-            if col in [2, 3, 4, 5]:
-                text = item.data(Qt.ItemDataRole.UserRole)
+            # Insert at correct position based on drop indicator
+            drop_at_top = getattr(target_item, '_drop_at_top', False)
+            if drop_at_top:
+                insert_idx = target_idx
             else:
-                text = item.text()
+                insert_idx = target_idx + 1
 
-            if text and text not in ["(none)", "-", "ERROR"]:
-                QApplication.clipboard().setText(str(text))
+            self.state.groups.insert(insert_idx, group)
+            self._refresh_groups()
 
-                # Visual feedback - highlight the copied cell yellow
-                original_bg = item.background()
-                item.setBackground(QColor("#FEF08A"))  # Yellow highlight
+    def _on_add_group(self) -> None:
+        """Add a new group with inline editing."""
+        zh = self.state.language == 'zh'
 
-                # Reset background after 500ms
-                QTimer.singleShot(500, lambda: item.setBackground(original_bg))
+        # Create group with empty name placeholder
+        new_group = Group(name="", color="blue")
+        self.state.groups.append(new_group)
+        self._refresh_groups()
 
-                # Show which column was copied
-                column_keys = ['', 'id', 'email', 'password', 'secondary_email', '2fa_key', '2fa_code', 'import_time', 'tags', 'notes', '']
-                col_name = self.tr(column_keys[col]) if col < len(column_keys) else "Text"
-                self.toast.show_message(f"{self.tr('copied')}: {col_name}", self, 1000)
-
-    def _show_tag_popup(self, row: int) -> None:
-        """Show a popup to manage tags for an account."""
-        id_item = self.table.item(row, 1)
-        if not id_item:
-            return
-
-        account_idx = id_item.data(Qt.ItemDataRole.UserRole + 1)
-        if account_idx is None or account_idx >= len(self.state.accounts):
-            return
-
-        account = self.state.accounts[account_idx]
-        account_groups = account.groups
-
-        if not account_groups:
-            # No groups, show option to add
-            self._show_add_group_popup(row, account_idx)
-            return
-
-        # Create popup menu at cursor position - Notion style
-        menu = QMenu(self)
-        menu.setStyleSheet("""
-            QMenu {
-                background-color: #FFFFFF;
-                border: 1px solid #E9E9E7;
-                border-radius: 6px;
-                padding: 6px;
-            }
-            QMenu::item { padding: 8px 16px 8px 10px; border-radius: 4px; color: #37352F; }
-            QMenu::item:selected { background-color: #EFEFEF; }
-            QMenu::separator { height: 1px; background: #E9E9E7; margin: 4px 8px; }
-        """)
-
-        # Current groups with remove option
-        for group_name in account_groups:
-            for g in self.state.groups:
-                if g.name == group_name:
-                    action = menu.addAction(f"✕  {group_name}")
-                    action.setIcon(QIcon(create_dot_icon(get_color_hex(g.color), 10)))
-                    action.triggered.connect(lambda checked, gn=group_name, r=row: self._remove_row_from_group(r, gn))
+        # Find the new group's input and focus it after a short delay
+        def focus_new_input():
+            for btn in self.group_buttons:
+                if isinstance(btn, EditableGroupItem) and btn.group.name == "":
+                    btn.name_input.setPlaceholderText("新分组" if zh else "New Group")
+                    btn.name_input.setFocus()
+                    btn.name_input.selectAll()
+                    # Handle empty name on focus lost
+                    def on_editing_done(item=btn):
+                        name = item.name_input.text().strip()
+                        if not name:
+                            # Use default name if empty
+                            base_name = "新分组" if self.state.language == 'zh' else "New Group"
+                            name = base_name
+                            counter = 1
+                            existing_names = {g.name for g in self.state.groups if g != item.group}
+                            while name in existing_names:
+                                counter += 1
+                                name = f"{base_name} {counter}"
+                            item.group.name = name
+                            item.name_input.setText(name)
+                        elif item.group.name == "":
+                            item.group.name = name
+                        self._save_data()
+                    try:
+                        btn.name_input.editingFinished.disconnect()
+                    except:
+                        pass
+                    btn.name_input.editingFinished.connect(on_editing_done)
                     break
 
-        menu.addSeparator()
+        QTimer.singleShot(50, focus_new_input)
 
-        # Add to other groups
-        available_groups = [g for g in self.state.groups if g.name not in account_groups]
-        if available_groups:
-            for group in available_groups:
-                action = menu.addAction(f"+  {group.name}")
-                action.setIcon(QIcon(create_dot_icon(get_color_hex(group.color), 10)))
-                action.triggered.connect(lambda checked, gn=group.name, r=row: self._add_row_to_group(r, gn))
+    def _highlight_selected_group(self) -> None:
+        """Highlight selected group button."""
+        for btn in self.group_buttons:
+            group_id = btn.property("group_id")
+            btn.set_selected(group_id == self.selected_group)
 
-        menu.exec(self.table.viewport().mapToGlobal(self.table.visualRect(self.table.model().index(row, 8)).bottomLeft()))
+    def _on_group_clicked(self, group_id: Optional[str]) -> None:
+        """Handle group selection."""
+        self.selected_group = group_id
+        self._highlight_selected_group()
+        self._refresh_account_list()
 
-    def _show_add_group_popup(self, row: int, account_idx: int) -> None:
-        """Show popup to add account to a group when it has no groups."""
-        if not self.state.groups:
-            return
-
-        menu = QMenu(self)
-        menu.setStyleSheet("""
-            QMenu {
-                background-color: #FFFFFF;
-                border: 1px solid #E9E9E7;
-                border-radius: 6px;
-                padding: 6px;
-            }
-            QMenu::item { padding: 8px 16px 8px 10px; border-radius: 4px; color: #37352F; }
-            QMenu::item:selected { background-color: #EFEFEF; }
-        """)
-
-        for group in self.state.groups:
-            action = menu.addAction(group.name)
-            action.setIcon(QIcon(create_dot_icon(get_color_hex(group.color), 10)))
-            action.triggered.connect(lambda checked, gn=group.name, r=row: self._add_row_to_group(r, gn))
-
-        menu.exec(self.table.viewport().mapToGlobal(self.table.visualRect(self.table.model().index(row, 8)).bottomLeft()))
-
-    def _on_item_changed(self, item: QTableWidgetItem) -> None:
-        """Handle item edit - only notes column (9) is editable."""
-        if item is None:
-            return
-
-        col = item.column()
-        row = item.row()
-
-        # Only handle notes column (9)
-        if col != 9:
-            return
-
-        id_item = self.table.item(row, 1)
-        if not id_item:
-            return
-        account_idx = id_item.data(Qt.ItemDataRole.UserRole + 1)
-        if account_idx is None or account_idx >= len(self.state.accounts):
-            return
-
-        account = self.state.accounts[account_idx]
-        new_value = item.text()
-
-        if account.notes != new_value:
-            account.notes = new_value
-            self._save_data()
-
-    def _on_checkbox_clicked(self, row: int, checked: bool) -> None:
-        """Handle checkbox click."""
-        if checked:
-            self.selected_rows.add(row)
-            self._highlight_row(row, True)
-        else:
-            self.selected_rows.discard(row)
-            self._highlight_row(row, False)
-        self._update_batch_toolbar()
-        self._update_select_all_button()
-
-    def _on_checkbox_changed(self, row: int, state: int) -> None:
-        """Handle checkbox state change (legacy fallback)."""
-        if state == Qt.CheckState.Checked.value:
-            self.selected_rows.add(row)
-            self._highlight_row(row, True)
-        else:
-            self.selected_rows.discard(row)
-            self._highlight_row(row, False)
-        self._update_batch_toolbar()
-        self._update_select_all_button()
-
-    def _on_header_checkbox_changed(self, state: int) -> None:
-        """Handle header checkbox state change for select all."""
-        if state == Qt.CheckState.Checked.value:
-            # Select all visible rows
-            visible_rows = [row for row in range(self.table.rowCount()) if not self.table.isRowHidden(row)]
-            for row in visible_rows:
-                widget = self.table.cellWidget(row, 0)
-                if widget:
-                    checkbox = widget.findChild(QCheckBox)
-                    if checkbox and not checkbox.isChecked():
-                        checkbox.blockSignals(True)
-                        checkbox.setChecked(True)
-                        checkbox.blockSignals(False)
-                    self.selected_rows.add(row)
-                    self._highlight_row(row, True)
-            self.table.viewport().update()
-            self._update_batch_toolbar()
-        else:
-            self._clear_selection()
-
-    def _update_select_all_button(self) -> None:
-        """Update header checkbox based on current selection."""
-        visible_rows = [row for row in range(self.table.rowCount()) if not self.table.isRowHidden(row)]
-        all_selected = len(self.selected_rows) >= len(visible_rows) and len(visible_rows) > 0
-
-        self.header_checkbox.blockSignals(True)
-        self.header_checkbox.setChecked(all_selected)
-        self.header_checkbox.blockSignals(False)
-
-    def _update_header_checkbox_position(self) -> None:
-        """Position the header checkbox to fill first column header."""
-        header = self.table.horizontalHeader()
-        col_x = header.sectionViewportPosition(0)
-        col_width = header.sectionSize(0)
-        header_height = header.height()
-        self.header_checkbox_widget.setGeometry(col_x, 0, col_width, header_height)
-
-    def resizeEvent(self, event) -> None:
-        """Handle resize to reposition header checkbox."""
-        super().resizeEvent(event)
-        if hasattr(self, 'header_checkbox_widget'):
-            self._update_header_checkbox_position()
-
-    def showEvent(self, event) -> None:
-        """Handle show event to position header checkbox."""
-        super().showEvent(event)
-        if hasattr(self, 'header_checkbox_widget'):
-            self._update_header_checkbox_position()
-
-    def _highlight_row(self, row: int, selected: bool) -> None:
-        """Highlight or unhighlight a row."""
-        bg_color = QColor("#E0E7FF") if selected else QColor("#FFFFFF")
-
-        for col in [0, 8]:
-            widget = self.table.cellWidget(row, col)
-            if widget:
-                widget.setStyleSheet(f"background-color: {bg_color.name()};")
-
-        for col in [1, 2, 3, 4, 5, 6, 7, 9]:
-            item = self.table.item(row, col)
-            if item:
-                item.setBackground(bg_color)
-
-    def _update_batch_toolbar(self) -> None:
-        """Update batch toolbar visibility."""
-        if self.selected_rows:
-            self.selected_label.setText(self.tr('selected_count').format(len(self.selected_rows)))
-            self.batch_toolbar.show()
-        else:
-            self.batch_toolbar.hide()
-
-    def _show_context_menu(self, pos) -> None:
-        """Show context menu for table."""
-        row = self.table.rowAt(pos.y())
-        if row < 0:
-            return
+    def _on_group_right_clicked(self, group_name: str, pos) -> None:
+        """Handle right-click on group button - show context menu."""
+        t = get_theme()
+        zh = self.state.language == 'zh'
+        is_dark = get_theme_manager().is_dark
+        ic = t.text_secondary
 
         menu = QMenu(self)
-        menu.setStyleSheet("""
-            QMenu { background-color: #FFFFFF; border: 1px solid #E9E9E7; border-radius: 6px; padding: 6px; }
-            QMenu::item { padding: 8px 12px; border-radius: 4px; color: #37352F; }
-            QMenu::item:selected { background-color: #EFEFEF; }
-            QMenu::separator { height: 1px; background: #E9E9E7; margin: 4px 8px; }
+        menu.setStyleSheet(f"""
+            QMenu {{
+                background-color: {t.bg_primary};
+                border: 1px solid {t.border};
+                border-radius: 8px;
+                padding: 4px;
+            }}
+            QMenu::item {{
+                padding: 8px 16px;
+                border-radius: 4px;
+                color: {t.text_primary};
+            }}
+            QMenu::item:selected {{
+                background-color: {t.bg_hover};
+            }}
         """)
 
-        # Add to group submenu
-        if self.state.groups:
-            add_menu = menu.addMenu(self.tr('add_to_group'))
-            add_menu.setIcon(QIcon(create_folder_icon(14)))
-            for group in self.state.groups:
-                action = add_menu.addAction(group.name)
-                action.setIcon(QIcon(create_dot_icon(get_color_hex(group.color), 10)))
-                action.triggered.connect(lambda checked, g=group.name, r=row: self._add_row_to_group(r, g))
+        # Rename action
+        rename_action = menu.addAction(QIcon(icon_edit(14, ic)), "重命名" if zh else "Rename")
+        rename_action.triggered.connect(lambda: self._rename_group(group_name))
 
-        # Remove from group submenu
-        id_item = self.table.item(row, 1)
-        if id_item:
-            account_idx = id_item.data(Qt.ItemDataRole.UserRole + 1)
-            if account_idx is not None and account_idx < len(self.state.accounts):
-                account_groups = self.state.accounts[account_idx].groups
-                if account_groups:
-                    remove_menu = menu.addMenu(self.tr('remove_from_group'))
-                    remove_menu.setIcon(QIcon(create_minus_icon(14, '#6B7280')))
-                    for group_name in account_groups:
-                        for g in self.state.groups:
-                            if g.name == group_name:
-                                action = remove_menu.addAction(g.name)
-                                action.setIcon(QIcon(create_dot_icon(get_color_hex(g.color), 10)))
-                                action.triggered.connect(lambda checked, gn=group_name, r=row: self._remove_row_from_group(r, gn))
-                                break
+        # Move up action
+        group_index = next((i for i, g in enumerate(self.state.groups) if g.name == group_name), -1)
+        if group_index > 0:
+            move_up_action = menu.addAction(QIcon(icon_arrow_up(14, ic)), "上移" if zh else "Move up")
+            move_up_action.triggered.connect(lambda: self._move_group(group_name, -1))
 
-        menu.addSeparator()
-
-        # Edit notes action
-        notes_action = menu.addAction(self.tr('edit_notes'))
-        notes_action.setIcon(QIcon(create_edit_icon(14, '#6B7280')))
-        notes_action.triggered.connect(lambda: self._edit_notes(row))
+        # Move down action
+        if group_index < len(self.state.groups) - 1:
+            move_down_action = menu.addAction(QIcon(icon_arrow_down(14, ic)), "下移" if zh else "Move down")
+            move_down_action.triggered.connect(lambda: self._move_group(group_name, 1))
 
         menu.addSeparator()
 
         # Delete action
-        delete_action = menu.addAction(self.tr('delete'))
-        delete_action.setIcon(QIcon(create_trash_icon(14, '#6B7280')))
-        delete_action.triggered.connect(lambda: self._delete_row(row))
+        delete_action = menu.addAction(QIcon(icon_trash(14, t.error)), "删除" if zh else "Delete")
+        delete_action.triggered.connect(lambda: self._on_group_deleted(group_name))
 
-        menu.exec(self.table.viewport().mapToGlobal(pos))
+        menu.exec(pos)
 
-    def _add_row_to_group(self, row: int, group_name: str) -> None:
-        """Add a single row to a group."""
-        id_item = self.table.item(row, 1)
-        if id_item:
-            account_idx = id_item.data(Qt.ItemDataRole.UserRole + 1)
-            if account_idx is not None and account_idx < len(self.state.accounts):
-                self.state.accounts[account_idx].add_to_group(group_name)
-                self._update_tags_cell(row, account_idx)
-                self._save_data()
-                self._refresh_group_list()
+    def _rename_group(self, old_name: str) -> None:
+        """Rename a group."""
+        zh = self.state.language == 'zh'
 
-    def _remove_row_from_group(self, row: int, group_name: str) -> None:
-        """Remove a single row from a group."""
-        id_item = self.table.item(row, 1)
-        if id_item:
-            account_idx = id_item.data(Qt.ItemDataRole.UserRole + 1)
-            if account_idx is not None and account_idx < len(self.state.accounts):
-                self.state.accounts[account_idx].remove_from_group(group_name)
-                self._update_tags_cell(row, account_idx)
-                self._save_data()
-                self._refresh_group_list()
-
-    def _edit_notes(self, row: int) -> None:
-        """Edit notes for a row."""
-        notes_item = self.table.item(row, 9)
-        if notes_item:
-            self.table.editItem(notes_item)
-
-    def _delete_row(self, row: int) -> None:
-        """Delete a single row."""
-        id_item = self.table.item(row, 1)
-        if not id_item:
-            return
-        account_idx = id_item.data(Qt.ItemDataRole.UserRole + 1)
-        if account_idx is None or account_idx >= len(self.state.accounts):
-            return
-
-        account = self.state.accounts[account_idx]
-        reply = QMessageBox.question(
-            self, self.tr('confirm_delete'),
-            self.tr('confirm_delete_msg').format(account.email),
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        new_name, ok = QInputDialog.getText(
+            self,
+            "重命名分组" if zh else "Rename Group",
+            "新名称:" if zh else "New name:",
+            text=old_name
         )
-        if reply == QMessageBox.StandardButton.Yes:
-            self.account_service.delete(account.id, move_to_trash=True)
-            self._save_data()
-            self._load_accounts_to_table()
-            self._refresh_group_list()
 
-    # ========== Batch Operations ==========
+        if ok and new_name.strip() and new_name.strip() != old_name:
+            new_name = new_name.strip()
 
-    def _batch_add_to_group(self) -> None:
-        """Add selected accounts to a group."""
-        if not self.selected_rows or not self.state.groups:
-            return
-
-        groups = [g.name for g in self.state.groups]
-        choice, ok = QInputDialog.getItem(
-            self, self.tr('batch_add_group'),
-            self.tr('add_to_group'), groups, 0, False
-        )
-        if ok and choice:
-            for row in self.selected_rows:
-                id_item = self.table.item(row, 1)
-                if id_item:
-                    idx = id_item.data(Qt.ItemDataRole.UserRole + 1)
-                    if idx is not None and idx < len(self.state.accounts):
-                        self.state.accounts[idx].add_to_group(choice)
-                        self._update_tags_cell(row, idx)
-
-            self._save_data()
-            self._refresh_group_list()
-            self._clear_selection()
-
-    def _batch_remove_from_group(self) -> None:
-        """Remove selected accounts from a group."""
-        if not self.selected_rows:
-            return
-
-        # Find groups used by selected accounts
-        groups_used = set()
-        for row in self.selected_rows:
-            id_item = self.table.item(row, 1)
-            if id_item:
-                idx = id_item.data(Qt.ItemDataRole.UserRole + 1)
-                if idx is not None and idx < len(self.state.accounts):
-                    groups_used.update(self.state.accounts[idx].groups)
-
-        if not groups_used:
-            return
-
-        choice, ok = QInputDialog.getItem(
-            self, self.tr('batch_remove_group'),
-            self.tr('remove_from_group'), list(groups_used), 0, False
-        )
-        if ok and choice:
-            for row in self.selected_rows:
-                id_item = self.table.item(row, 1)
-                if id_item:
-                    idx = id_item.data(Qt.ItemDataRole.UserRole + 1)
-                    if idx is not None and idx < len(self.state.accounts):
-                        self.state.accounts[idx].remove_from_group(choice)
-                        self._update_tags_cell(row, idx)
-
-            self._save_data()
-            self._refresh_group_list()
-            self._clear_selection()
-
-    def _batch_delete(self) -> None:
-        """Delete selected accounts."""
-        if not self.selected_rows:
-            return
-
-        count = len(self.selected_rows)
-        reply = QMessageBox.question(
-            self, self.tr('confirm_delete'),
-            self.tr('confirm_clear_msg').format(count),
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
-        )
-        if reply == QMessageBox.StandardButton.Yes:
-            # Get account IDs to delete
-            ids_to_delete = []
-            for row in sorted(self.selected_rows, reverse=True):
-                id_item = self.table.item(row, 1)
-                if id_item:
-                    idx = id_item.data(Qt.ItemDataRole.UserRole + 1)
-                    if idx is not None and idx < len(self.state.accounts):
-                        ids_to_delete.append(self.state.accounts[idx].id)
-
-            for acc_id in ids_to_delete:
-                self.account_service.delete(acc_id, move_to_trash=True)
-
-            self._save_data()
-            self._load_accounts_to_table()
-            self._refresh_group_list()
-            self._clear_selection()
-
-    def _clear_selection(self) -> None:
-        """Clear all selected rows."""
-        for row in list(self.selected_rows):
-            checkbox_widget = self.table.cellWidget(row, 0)
-            if checkbox_widget:
-                checkbox = checkbox_widget.findChild(QCheckBox)
-                if checkbox:
-                    checkbox.setChecked(False)
-            self._highlight_row(row, False)
-        self.selected_rows.clear()
-        self._update_batch_toolbar()
-
-    # ========== Group Management ==========
-
-    def _show_manage_groups(self, open_add: bool = False) -> None:
-        """Show group management dialog with full functionality."""
-        # If dialog already open, bring to front
-        if self.group_dialog is not None:
-            self.group_dialog.raise_()
-            self.group_dialog.activateWindow()
-            return
-
-        dialog = QDialog(self)
-        dialog.setWindowTitle(self.tr('manage_groups'))
-        dialog.resize(420, 450)
-        dialog.setStyleSheet("QDialog { background-color: white; }")
-
-        layout = QVBoxLayout()
-        layout.setSpacing(16)
-        layout.setContentsMargins(20, 20, 20, 20)
-        dialog.setLayout(layout)
-
-        # Title row with add button
-        title_row = QHBoxLayout()
-        title = QLabel(self.tr('manage_groups'))
-        title.setFont(QFont("Microsoft YaHei UI", 16, QFont.Weight.DemiBold))
-        title.setStyleSheet("color: #37352F;")
-        title_row.addWidget(title)
-        title_row.addStretch()
-
-        # Add new group button
-        btn_show_add = QToolButton()
-        btn_show_add.setFixedSize(32, 32)
-        btn_show_add.setCursor(Qt.CursorShape.PointingHandCursor)
-        btn_show_add.setIcon(QIcon(create_plus_icon(18)))
-        btn_show_add.setIconSize(QSize(18, 18))
-        btn_show_add.setStyleSheet("""
-            QToolButton { background: transparent; border: none; }
-            QToolButton:hover { background-color: #F3F4F6; border-radius: 8px; }
-        """)
-        title_row.addWidget(btn_show_add)
-        layout.addLayout(title_row)
-
-        # Divider
-        divider = QFrame()
-        divider.setFrameShape(QFrame.Shape.HLine)
-        divider.setStyleSheet("background-color: #E9E9E7;")
-        divider.setFixedHeight(1)
-        layout.addWidget(divider)
-
-        # Add new group section - Notion style
-        add_section = QFrame()
-        add_section.setStyleSheet("""
-            QFrame {
-                background-color: #FBFBFA;
-                border: 1px solid #E9E9E7;
-                border-radius: 8px;
-            }
-        """)
-
-        add_layout = QHBoxLayout(add_section)
-        add_layout.setContentsMargins(12, 12, 12, 12)
-        add_layout.setSpacing(10)
-
-        # Color selector button
-        color_names = list(GROUP_COLORS.keys())
-        self._selected_color_index = 0
-
-        color_btn = QPushButton()
-        color_btn.setFixedSize(36, 36)
-        color_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._add_color_btn = color_btn
-        self._update_add_color_button_style()
-
-        # Create color menu - Notion style
-        color_menu = QMenu(dialog)
-        color_menu.setStyleSheet("""
-            QMenu {
-                background: #FFFFFF;
-                border: 1px solid #E9E9E7;
-                border-radius: 6px;
-                padding: 8px;
-            }
-            QMenu::item { padding: 0px; background: transparent; }
-        """)
-        self._build_add_color_menu(color_menu, dialog)
-        color_btn.setMenu(color_menu)
-        add_layout.addWidget(color_btn)
-
-        # Name input
-        group_name_input = QLineEdit()
-        group_name_input.setFixedHeight(36)
-        group_name_input.setPlaceholderText(self.tr('group_name'))
-        group_name_input.setStyleSheet("""
-            QLineEdit {
-                font-size: 13px;
-                padding: 6px 10px;
-                border: 1px solid #E9E9E7;
-                border-radius: 6px;
-                background-color: white;
-                color: #37352F;
-            }
-            QLineEdit:focus { border-color: #37352F; }
-            QLineEdit::placeholder { color: #9CA3AF; }
-        """)
-        add_layout.addWidget(group_name_input, 1)
-        self._group_name_input = group_name_input
-
-        # Confirm add button
-        btn_add = QToolButton()
-        btn_add.setFixedSize(32, 32)
-        btn_add.setCursor(Qt.CursorShape.PointingHandCursor)
-        btn_add.setIcon(QIcon(create_check_icon(18, '#10B981')))
-        btn_add.setIconSize(QSize(18, 18))
-        btn_add.setStyleSheet("""
-            QToolButton { background: transparent; border: none; }
-            QToolButton:hover { background-color: #ECFDF5; border-radius: 8px; }
-        """)
-        add_layout.addWidget(btn_add)
-
-        # Cancel button
-        btn_cancel_add = QToolButton()
-        btn_cancel_add.setFixedSize(32, 32)
-        btn_cancel_add.setCursor(Qt.CursorShape.PointingHandCursor)
-        btn_cancel_add.setIcon(QIcon(create_close_icon(18, '#EF4444')))
-        btn_cancel_add.setIconSize(QSize(18, 18))
-        btn_cancel_add.setStyleSheet("""
-            QToolButton { background: transparent; border: none; }
-            QToolButton:hover { background-color: #FEF2F2; border-radius: 8px; }
-        """)
-        add_layout.addWidget(btn_cancel_add)
-
-        layout.addWidget(add_section)
-
-        def toggle_add_section():
-            if add_section.isVisible():
-                add_section.hide()
-            else:
-                add_section.show()
-                group_name_input.clear()
-                group_name_input.setFocus()
-
-        btn_show_add.clicked.connect(toggle_add_section)
-        btn_cancel_add.clicked.connect(lambda: add_section.hide())
-
-        # Group list with drag & drop support - Notion style
-        self._groups_list_widget = DraggableGroupList(self._on_groups_reordered)
-        self._groups_list_widget.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
-        self._groups_list_widget.setDefaultDropAction(Qt.DropAction.MoveAction)
-        self._groups_list_widget.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
-        self._groups_list_widget.setSpacing(4)
-        self._groups_list_widget.setStyleSheet("""
-            QListWidget {
-                background-color: #FBFBFA;
-                border: 1px solid #E9E9E7;
-                border-radius: 8px;
-                padding: 8px;
-                outline: none;
-            }
-            QListWidget::item { background: transparent; border: none; padding: 0px; }
-            QListWidget::item:selected { background: transparent; }
-            QScrollBar:vertical {
-                width: 6px; background: transparent; margin: 4px 2px;
-            }
-            QScrollBar::handle:vertical {
-                background: #D1D5DB; border-radius: 3px; min-height: 20px;
-            }
-            QScrollBar::handle:vertical:hover { background: #9CA3AF; }
-            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0px; }
-            QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: transparent; }
-        """)
-
-        # Store dialog reference BEFORE populating
-        self.group_dialog = dialog
-
-        # Populate groups
-        self._refresh_group_items()
-
-        layout.addWidget(self._groups_list_widget, 1)
-
-        def add_new_group():
-            name = group_name_input.text().strip()
-            if not name:
+            # Check if name already exists
+            if any(g.name == new_name for g in self.state.groups):
+                self.toast.show_message(f"分组「{new_name}」已存在" if zh else f"Group '{new_name}' already exists")
                 return
-            # Get selected preset color
-            color = color_names[self._selected_color_index % len(color_names)]
-            self.group_service.create(name, color)
+
+            # Update group name
+            for group in self.state.groups:
+                if group.name == old_name:
+                    group.name = new_name
+                    break
+
+            # Update accounts that use this group
+            for account in self.state.accounts:
+                if old_name in account.groups:
+                    account.groups.remove(old_name)
+                    account.groups.append(new_name)
+
+            # Update selected group if needed
+            if self.selected_group == old_name:
+                self.selected_group = new_name
+
             self._save_data()
-            self._refresh_group_list()
-            self._refresh_group_items()
-            group_name_input.clear()
-            # Reset to first color
-            self._selected_color_index = 0
-            self._update_add_color_button_style()
+            self._refresh_groups()
+            self._refresh_account_list()
+            self._update_detail_panel()
+            self.toast.show_message(f"已重命名为「{new_name}」" if zh else f"Renamed to '{new_name}'")
 
-        btn_add.clicked.connect(add_new_group)
+    def _move_group(self, group_name: str, direction: int) -> None:
+        """Move a group up or down in the list."""
+        group_index = next((i for i, g in enumerate(self.state.groups) if g.name == group_name), -1)
+        if group_index == -1:
+            return
 
-        # Use non-modal dialog so undo toast can be clicked
-        dialog.setModal(False)
-        dialog.finished.connect(lambda: setattr(self, 'group_dialog', None))
+        new_index = group_index + direction
+        if 0 <= new_index < len(self.state.groups):
+            # Swap groups
+            self.state.groups[group_index], self.state.groups[new_index] = \
+                self.state.groups[new_index], self.state.groups[group_index]
+            self._save_data()
+            self._refresh_groups()
 
-        # Show add section initially if open_add is True
-        if not open_add:
-            add_section.hide()
+    def _get_filtered_accounts(self) -> List[Account]:
+        """Get accounts filtered by current group and search."""
+        accounts = self.state.accounts
+        if self.selected_group:
+            accounts = [a for a in accounts if self.selected_group in a.groups]
+
+        # Apply search filter
+        search_text = self.search_input.text().strip() if hasattr(self, 'search_input') else ""
+        if search_text:
+            s = search_text.lower()
+            def match_account(a):
+                # Search in email
+                if s in a.email.lower():
+                    return True
+                # Search in password
+                if a.password and s in a.password.lower():
+                    return True
+                # Search in backup email
+                backup = getattr(a, 'backup', '') or getattr(a, 'backup_email', '') or ''
+                if backup and s in backup.lower():
+                    return True
+                # Search in 2FA secret
+                if a.secret and s in a.secret.lower():
+                    return True
+                # Search in notes
+                if a.notes and s in a.notes.lower():
+                    return True
+                # Search in groups
+                for group in a.groups:
+                    if s in group.lower():
+                        return True
+                return False
+            accounts = [a for a in accounts if match_account(a)]
+
+        return accounts
+
+    def _refresh_account_list(self, search_text: str = "") -> None:
+        """Refresh account list."""
+        # If in list view mode, refresh the table instead
+        if self.list_view_mode:
+            self._refresh_table_view()
+            return
+
+        # Clear old widgets
+        self.account_widgets.clear()
+        while self.account_list_layout.count() > 1:
+            child = self.account_list_layout.takeAt(0)
+            widget = child.widget()
+            if widget:
+                widget.hide()
+                widget.setParent(None)
+                widget.deleteLater()
+
+        accounts = self.state.accounts
+        if self.selected_group:
+            accounts = [a for a in accounts if self.selected_group in a.groups]
+        if search_text:
+            s = search_text.lower()
+            def match_account(a):
+                # Search in email
+                if s in a.email.lower():
+                    return True
+                # Search in password
+                if a.password and s in a.password.lower():
+                    return True
+                # Search in backup email
+                backup = getattr(a, 'backup', '') or getattr(a, 'backup_email', '') or ''
+                if backup and s in backup.lower():
+                    return True
+                # Search in 2FA secret
+                if a.secret and s in a.secret.lower():
+                    return True
+                # Search in notes
+                if a.notes and s in a.notes.lower():
+                    return True
+                # Search in groups
+                for group in a.groups:
+                    if s in group.lower():
+                        return True
+                return False
+            accounts = [a for a in accounts if match_account(a)]
+
+        # Clear selection if list is empty (empty category)
+        if not accounts:
+            self.selected_account = None
+            self._update_detail_panel()
+
+        zh = self.state.language == 'zh'
+        group_name = self.selected_group or ("全部账户" if zh else "All Accounts")
+        count_text = "个账户" if zh else " accounts"
+        self.list_title.setText(f"{group_name} · {len(accounts)}{count_text}")
+
+        t = get_theme()
+        for i, account in enumerate(accounts):
+            # Add separator before item (except first)
+            if i > 0:
+                separator = QFrame()
+                separator.setFixedHeight(1)
+                separator.setStyleSheet(f"background-color: {t.border};")
+                self.account_list_layout.insertWidget(self.account_list_layout.count() - 1, separator)
+
+            item = self._create_account_item(account, t, i)
+            self.account_widgets.append(item)
+            self.account_list_layout.insertWidget(self.account_list_layout.count() - 1, item)
+
+        self._highlight_selected_account()
+
+    def _create_account_item(self, account: Account, t, index: int) -> ClickableFrame:
+        """Create account list item widget."""
+        item = ClickableFrame()
+        item.setProperty("account", account)
+        item.setProperty("account_index", index)
+        item.setCursor(Qt.CursorShape.PointingHandCursor)
+
+        # Connect signals with lambda using default args to capture values
+        item.clicked.connect(lambda acc=account, idx=index: self._on_account_clicked(acc, idx))
+        item.rightClicked.connect(lambda pos, acc=account: self._show_account_context_menu(pos, acc))
+
+        if self.list_view_mode:
+            # List view: compact single row - just checkbox, ID, email
+            layout = QHBoxLayout(item)
+            layout.setContentsMargins(12, 6, 12, 6)
+            layout.setSpacing(6)
+
+            # Checkbox icon button for multi-select
+            if self.multi_select_mode:
+                is_checked = self.selection_manager.is_selected(account)
+                check_label = QLabel()
+                check_label.setFixedSize(20, 20)
+                check_label.setPixmap(icon_checkbox(16, t.text_secondary) if is_checked else icon_checkbox_empty(16, t.text_tertiary))
+                check_label.setStyleSheet("QLabel { background: transparent; }")
+                check_label.setProperty("account", account)
+                check_label.setProperty("is_checkbox", True)
+                layout.addWidget(check_label)
+
+            # ID number
+            id_label = QLabel(f"#{index + 1}")
+            id_label.setFixedWidth(32)
+            id_label.setStyleSheet(f"font-size: 11px; color: {t.text_tertiary};")
+            layout.addWidget(id_label)
+
+            # Email only
+            if self.codes_visible:
+                email_text = account.email
+            else:
+                if '@' in account.email:
+                    local, domain = account.email.split('@', 1)
+                    email_text = f"{local[:3]}***@{domain}" if len(local) > 3 else f"{local}***@{domain}"
+                else:
+                    email_text = f"{account.email[:3]}***" if len(account.email) > 3 else account.email
+
+            email_label = QLabel(email_text)
+            email_label.setStyleSheet(f"font-size: 12px; color: {t.text_primary};")
+            layout.addWidget(email_label, 1)
+
         else:
-            group_name_input.setFocus()
+            # Card view: multi-line with ID, checkbox, email, group, notes
+            layout = QVBoxLayout(item)
+            layout.setContentsMargins(12, 10, 12, 10)
+            layout.setSpacing(4)
 
-        dialog.show()
+            # Top row: checkbox + ID + email
+            top_row = QHBoxLayout()
+            top_row.setSpacing(8)
 
-    def _update_add_color_button_style(self) -> None:
-        """Update add color button to show current selected color."""
-        color_names = list(GROUP_COLORS.keys())
-        color_hex = get_color_hex(color_names[self._selected_color_index % len(color_names)])
-        pastel_fill = get_pastel_color(color_hex)
+            # Checkbox icon for multi-select (visual only, click handled by card)
+            checkbox_width = 0
+            if self.multi_select_mode:
+                is_checked = self.selection_manager.is_selected(account)
+                check_label = QLabel()
+                check_label.setFixedSize(20, 20)
+                check_label.setPixmap(icon_checkbox(16, t.text_secondary) if is_checked else icon_checkbox_empty(16, t.text_tertiary))
+                check_label.setStyleSheet("QLabel { background: transparent; }")
+                check_label.setProperty("account", account)
+                check_label.setProperty("is_checkbox", True)
+                top_row.addWidget(check_label)
+                checkbox_width = 28  # checkbox label width + spacing
 
-        self._add_color_btn.setStyleSheet(f"""
-            QPushButton {{ background-color: transparent; border: none; }}
-            QPushButton::menu-indicator {{ image: none; width: 0px; }}
-        """)
+            # ID number - fixed width for consistent tag alignment
+            id_label = QLabel(f"#{index + 1}")
+            id_label.setFixedWidth(28)
+            id_label.setStyleSheet(f"font-size: 11px; color: {t.text_tertiary};")
+            top_row.addWidget(id_label)
 
-        # Clear existing layout
-        if self._add_color_btn.layout():
-            while self._add_color_btn.layout().count():
-                item = self._add_color_btn.layout().takeAt(0)
-                if item.widget():
-                    item.widget().deleteLater()
+            # Email
+            if self.codes_visible:
+                email_text = account.email
+            else:
+                if '@' in account.email:
+                    local, domain = account.email.split('@', 1)
+                    email_text = f"{local[:3]}***@{domain}" if len(local) > 3 else f"{local}***@{domain}"
+                else:
+                    email_text = f"{account.email[:3]}***" if len(account.email) > 3 else account.email
+
+            email_label = QLabel(email_text)
+            email_label.setStyleSheet(f"font-size: 13px; font-weight: 500; color: {t.text_primary};")
+            top_row.addWidget(email_label, 1)
+
+            layout.addLayout(top_row)
+
+            # Tags row with flow layout - aligned with email (ID width 28 + spacing 8 = 36 + checkbox if multi-select)
+            if account.groups:
+                tags_wrapper = QHBoxLayout()
+                tags_left_margin = 36 + checkbox_width  # Align with email position
+                tags_wrapper.setContentsMargins(tags_left_margin, 0, 0, 0)
+                tags_wrapper.setSpacing(0)
+
+                tags_container = QWidget()
+                is_dark = get_theme_manager().is_dark
+                tags_flow = FlowLayout(spacing=4)
+
+                # Tags with inset effect in dark mode
+                tag_fg = t.text_primary
+
+                for group_name in account.groups:
+                    tag = QLabel(group_name)
+                    if is_dark:
+                        # Same gray color as library button
+                        tag.setStyleSheet(f"""
+                            background-color: #9CA3AF;
+                            color: {t.bg_primary};
+                            padding: 2px 6px;
+                            border: none;
+                            border-radius: 4px;
+                            font-size: 10px;
+                            font-weight: 500;
+                        """)
+                    else:
+                        tag.setStyleSheet(f"""
+                            background-color: rgba(120, 120, 128, 0.16);
+                            color: {tag_fg};
+                            padding: 2px 6px;
+                            border: none;
+                            border-radius: 4px;
+                            font-size: 10px;
+                            font-weight: 500;
+                        """)
+                    tags_flow.addWidget(tag)
+
+                tags_flow.apply_layout(250)  # 320 - 24 margins - 36 tag indent - scrollbar
+                tags_container.setLayout(tags_flow)
+                tags_wrapper.addWidget(tags_container)
+                tags_wrapper.addStretch()
+                layout.addLayout(tags_wrapper)
+
+        # Apply selection style in multi-select mode
+        is_selected = self.multi_select_mode and self.selection_manager.is_selected(account)
+        if is_selected:
+            # Selected style - more visible gray background
+            item.setStyleSheet(f"""
+                QFrame {{
+                    background-color: {t.border};
+                }}
+            """)
         else:
-            btn_layout = QHBoxLayout(self._add_color_btn)
-            btn_layout.setContentsMargins(0, 0, 0, 0)
-            btn_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            # Normal style
+            item.setStyleSheet(f"""
+                QFrame {{
+                    background-color: transparent;
+                }}
+                QFrame:hover {{
+                    background-color: {t.bg_hover};
+                }}
+            """)
 
-        # Rounded square color indicator
-        dot = QLabel()
-        dot.setFixedSize(20, 20)
-        dot.setStyleSheet(f"""
-            background-color: {pastel_fill};
-            border: 1px solid #9CA3AF;
-            border-radius: 4px;
+        return item
+
+    def _on_account_clicked(self, account: Account, index: int = -1) -> None:
+        """Handle account selection with Excel-style modifier key support."""
+        if self.multi_select_mode:
+            # Detect Shift key at click time
+            modifiers = QApplication.keyboardModifiers()
+            shift_held = bool(modifiers & Qt.KeyboardModifier.ShiftModifier)
+
+            # Get filtered accounts list for range selection
+            filtered = self._get_filtered_accounts()
+
+            # Use SelectionManager to handle the click
+            self.selection_manager.handle_click(account, index, filtered, shift_held)
+
+            # Update visual state without recreating widgets
+            self._update_selection_visuals()
+            self._update_batch_bar()
+            return
+
+        # Normal mode: select account
+        # Reset edit mode if switching accounts
+        if self.detail_edit_mode and self.selected_account != account:
+            self.detail_edit_mode = False
+            t = get_theme()
+            self.btn_edit.setIcon(QIcon(icon_edit(14, t.text_secondary)))
+
+        self.selected_account = account
+        self._highlight_selected_account()
+        self._update_detail_panel()
+
+    def _show_account_context_menu(self, pos: 'QPoint', account: Account) -> None:
+        """Show context menu for account card."""
+        t = get_theme()
+        zh = self.state.language == 'zh'
+
+        menu_style = f"""
+            QMenu {{
+                background-color: {t.bg_secondary};
+                border: 1px solid {t.border};
+                border-radius: 8px;
+                padding: 4px;
+            }}
+            QMenu::item {{
+                padding: 8px 16px;
+                border-radius: 4px;
+                color: {t.text_primary};
+            }}
+            QMenu::item:selected {{
+                background-color: {t.bg_hover};
+            }}
+        """
+
+        menu = QMenu(self)
+        menu.setStyleSheet(menu_style)
+        ic = t.text_secondary
+
+        # If in multi-select mode and account is in selection, use batch operations
+        if self.multi_select_mode and self.selection_manager.is_selected(account):
+            # "Add to group" submenu
+            add_menu = menu.addMenu(QIcon(icon_square_plus(14, ic)), "添加到分组" if zh else "Add to group")
+            add_menu.setStyleSheet(menu_style)
+
+            for group in self.state.groups:
+                action = add_menu.addAction(f"■ {group.name}")
+                action.triggered.connect(lambda checked, g=group.name: self._batch_add_to_group(g))
+
+            if self.state.groups:
+                add_menu.addSeparator()
+
+            new_action = add_menu.addAction("+ " + ("新建分组" if zh else "New group"))
+            new_action.triggered.connect(self._batch_add_to_new_group)
+
+            # "Remove from group" submenu
+            groups_in_selection = set()
+            for acc in self.selection_manager.items:
+                for g in acc.groups:
+                    groups_in_selection.add(g)
+
+            if groups_in_selection:
+                remove_menu = menu.addMenu(QIcon(icon_square_minus(14, ic)), "从分组中移除" if zh else "Remove from group")
+                remove_menu.setStyleSheet(menu_style)
+
+                for group_name in sorted(groups_in_selection):
+                    action = remove_menu.addAction(f"■ {group_name}")
+                    action.triggered.connect(lambda checked, g=group_name: self._batch_remove_from_group(g))
+
+            menu.addSeparator()
+
+            # Batch copy
+            copy_action = menu.addAction(QIcon(icon_copy(14, ic)), "批量复制" if zh else "Batch copy")
+            copy_action.triggered.connect(self._batch_copy)
+
+            # Move to library submenu
+            from ..services.library_service import get_library_service
+            library_service = get_library_service()
+            libraries = library_service.list_libraries()
+            current_library = library_service.get_current_library()
+            other_libraries = [lib for lib in libraries if lib.id != current_library.id]
+
+            if other_libraries:
+                move_lib_menu = menu.addMenu(QIcon(icon_library_move(14, ic)), "移动到库" if zh else "Move to library")
+                move_lib_menu.setStyleSheet(menu_style)
+
+                for lib in other_libraries:
+                    lib_submenu = move_lib_menu.addMenu(QIcon(icon_library(14, ic)), lib.name)
+                    lib_submenu.setStyleSheet(menu_style)
+                    move_action = lib_submenu.addAction("移动" if zh else "Move")
+                    move_action.triggered.connect(lambda checked, l=lib: self._batch_move_to_library(l, remove_from_current=True))
+                    copy_action = lib_submenu.addAction("复制" if zh else "Copy")
+                    copy_action.triggered.connect(lambda checked, l=lib: self._batch_move_to_library(l, remove_from_current=False))
+
+            menu.addSeparator()
+
+            # Batch delete
+            delete_action = menu.addAction(QIcon(icon_trash(14, t.error)), "删除" if zh else "Delete")
+            delete_action.triggered.connect(self._batch_delete)
+
+        else:
+            # Single account operations
+            # Copy options
+            copy_email = menu.addAction(QIcon(icon_copy(14, ic)), "复制邮箱" if zh else "Copy email")
+            copy_email.triggered.connect(lambda: self._copy_field(account.email, "邮箱" if zh else "Email"))
+
+            if account.password:
+                copy_pwd = menu.addAction(QIcon(icon_key(14, ic)), "复制密码" if zh else "Copy password")
+                copy_pwd.triggered.connect(lambda: self._copy_field(account.password, "密码" if zh else "Password"))
+
+            if account.secret:
+                copy_code = menu.addAction(QIcon(icon_copy(14, ic)), "复制验证码" if zh else "Copy code")
+                copy_code.triggered.connect(lambda: self._copy_totp_for_account(account))
+
+            menu.addSeparator()
+
+            # Add to group submenu
+            add_menu = menu.addMenu(QIcon(icon_square_plus(14, ic)), "添加到分组" if zh else "Add to group")
+            add_menu.setStyleSheet(menu_style)
+
+            for group in self.state.groups:
+                action = add_menu.addAction(f"■ {group.name}")
+                action.triggered.connect(lambda checked, g=group.name, a=account: self._add_account_to_group(a, g))
+
+            if self.state.groups:
+                add_menu.addSeparator()
+
+            new_action = add_menu.addAction("+ " + ("新建分组" if zh else "New group"))
+            new_action.triggered.connect(lambda: self._add_account_to_new_group(account))
+
+            # Remove from group submenu
+            if account.groups:
+                remove_menu = menu.addMenu(QIcon(icon_square_minus(14, ic)), "从分组中移除" if zh else "Remove from group")
+                remove_menu.setStyleSheet(menu_style)
+
+                for group_name in account.groups:
+                    action = remove_menu.addAction(f"■ {group_name}")
+                    action.triggered.connect(lambda checked, g=group_name, a=account: self._remove_account_from_group(a, g))
+
+            # Move to library submenu
+            from ..services.library_service import get_library_service
+            library_service = get_library_service()
+            libraries = library_service.list_libraries()
+            current_library = library_service.get_current_library()
+            other_libraries = [lib for lib in libraries if lib.id != current_library.id]
+
+            if other_libraries:
+                move_lib_menu = menu.addMenu(QIcon(icon_library_move(14, ic)), "移动到库" if zh else "Move to library")
+                move_lib_menu.setStyleSheet(menu_style)
+
+                for lib in other_libraries:
+                    lib_submenu = move_lib_menu.addMenu(QIcon(icon_library(14, ic)), lib.name)
+                    lib_submenu.setStyleSheet(menu_style)
+                    move_action = lib_submenu.addAction("移动" if zh else "Move")
+                    move_action.triggered.connect(lambda checked, l=lib, a=account: self._move_account_to_library(a, l, remove_from_current=True))
+                    copy_action = lib_submenu.addAction("复制" if zh else "Copy")
+                    copy_action.triggered.connect(lambda checked, l=lib, a=account: self._move_account_to_library(a, l, remove_from_current=False))
+
+            menu.addSeparator()
+
+            # Delete
+            delete_action = menu.addAction(QIcon(icon_trash(14, t.error)), "删除" if zh else "Delete")
+            delete_action.triggered.connect(lambda: self._delete_single_account(account))
+
+        menu.exec(pos)
+
+    def _copy_field(self, value: str, label: str) -> None:
+        """Copy a field value to clipboard."""
+        QApplication.clipboard().setText(value)
+        zh = self.state.language == 'zh'
+        self.toast.show_message(f"已复制：{label}" if zh else f"Copied: {label}", center=True)
+
+    def _copy_totp_for_account(self, account: Account) -> None:
+        """Copy TOTP code for a specific account."""
+        from ..services.totp_service import TOTPService
+        code = TOTPService.generate_totp(account.secret)
+        if code:
+            QApplication.clipboard().setText(code)
+            zh = self.state.language == 'zh'
+            self.toast.show_message("已复制：验证码" if zh else "Copied: Verification Code", center=True)
+
+    def _add_account_to_group(self, account: Account, group_name: str) -> None:
+        """Add single account to a group."""
+        if group_name not in account.groups:
+            account.groups.append(group_name)
+            self._save_data()
+            self._refresh_account_list()
+            self._update_detail_panel()
+            self._refresh_groups()
+            zh = self.state.language == 'zh'
+            self.toast.show_message(f"已添加到「{group_name}」" if zh else f"Added to '{group_name}'")
+
+    def _add_account_to_new_group(self, account: Account) -> None:
+        """Create a new group and add single account to it."""
+        zh = self.state.language == 'zh'
+        name, ok = QInputDialog.getText(
+            self,
+            "新建分组" if zh else "New Group",
+            "分组名称:" if zh else "Group name:"
+        )
+
+        if ok and name.strip():
+            name = name.strip()
+            if not any(g.name == name for g in self.state.groups):
+                new_group = Group(name=name, color="blue")
+                self.state.groups.append(new_group)
+            self._add_account_to_group(account, name)
+
+    def _remove_account_from_group(self, account: Account, group_name: str) -> None:
+        """Remove single account from a group."""
+        if group_name in account.groups:
+            account.groups.remove(group_name)
+            self._save_data()
+            self._refresh_account_list()
+            self._update_detail_panel()
+            self._refresh_groups()
+            zh = self.state.language == 'zh'
+            self.toast.show_message(f"已从「{group_name}」移除" if zh else f"Removed from '{group_name}'")
+
+    def _delete_single_account(self, account: Account) -> None:
+        """Delete a single account with undo support."""
+        zh = self.state.language == 'zh'
+
+        if not self._show_delete_confirmation(
+            f"确定要删除账户 {account.email} 吗？" if zh else f"Delete account {account.email}?"
+        ):
+            return
+
+        # Store for undo
+        deleted_account = account
+        was_selected = self.selected_account == account
+
+        # Move to trash
+        if hasattr(self.state, 'trash'):
+            self.state.trash.append(account)
+        if account in self.state.accounts:
+            self.state.accounts.remove(account)
+
+        if was_selected:
+            self.selected_account = None
+
+        self._save_data()
+        self._refresh_groups()
+        self._refresh_account_list()
+        self._update_detail_panel()
+
+        # Undo callback
+        def undo_delete():
+            # Restore from trash
+            if hasattr(self.state, 'trash') and deleted_account in self.state.trash:
+                self.state.trash.remove(deleted_account)
+            self.state.accounts.append(deleted_account)
+            if was_selected:
+                self.selected_account = deleted_account
+            self._save_data()
+            self._refresh_groups()
+            self._refresh_account_list()
+            self._update_detail_panel()
+            self.toast.show_message("已恢复" if zh else "Restored")
+
+        # Show toast with undo
+        self.toast.show_message(
+            "已删除账户" if zh else "Account deleted",
+            duration=4000,
+            action_text="撤回" if zh else "Undo",
+            action_callback=undo_delete
+        )
+
+    def _on_checkbox_changed(self, account: Account, state: int) -> None:
+        """Handle checkbox state change in multi-select mode."""
+        acc_id = id(account)
+        if state == 2:  # Checked
+            if not self.selection_manager.is_selected(account):
+                self.selection_manager._selected[acc_id] = account
+        else:  # Unchecked
+            if self.selection_manager.is_selected(account):
+                del self.selection_manager._selected[acc_id]
+        self._update_batch_bar()
+
+    def _update_selection_visuals(self) -> None:
+        """Update visual state of account cards for multi-select mode without recreating widgets."""
+        t = get_theme()
+        for widget in self.account_widgets:
+            account = widget.property("account")
+            is_selected = self.selection_manager.is_selected(account)
+
+            # Update background style
+            if is_selected:
+                widget.setStyleSheet(f"""
+                    QFrame {{
+                        background-color: {t.border};
+                    }}
+                """)
+            else:
+                widget.setStyleSheet(f"""
+                    QFrame {{
+                        background-color: transparent;
+                    }}
+                    QFrame:hover {{
+                        background-color: {t.bg_hover};
+                    }}
+                """)
+
+            # Update checkbox icon
+            for child in widget.findChildren(QLabel):
+                if child.property("is_checkbox"):
+                    if is_selected:
+                        child.setPixmap(icon_checkbox(16, t.text_secondary))
+                    else:
+                        child.setPixmap(icon_checkbox_empty(16, t.text_tertiary))
+                    break
+
+    def _highlight_selected_account(self) -> None:
+        """Highlight selected account item."""
+        t = get_theme()
+        for widget in self.account_widgets:
+            account = widget.property("account")
+            # Check multi-select mode first
+            if self.multi_select_mode and self.selection_manager.is_selected(account):
+                widget.setStyleSheet(f"""
+                    QFrame {{
+                        background-color: {t.bg_hover};
+                    }}
+                """)
+            elif account == self.selected_account:
+                widget.setStyleSheet(f"""
+                    QFrame {{
+                        background-color: {t.bg_hover};
+                    }}
+                """)
+            else:
+                widget.setStyleSheet(f"""
+                    QFrame {{
+                        background-color: transparent;
+                    }}
+                    QFrame:hover {{
+                        background-color: {t.bg_hover};
+                    }}
+                """)
+
+    def _update_detail_panel(self) -> None:
+        """Update detail panel with selected account."""
+        t = get_theme()
+
+        if not self.selected_account:
+            self.empty_container.show()
+            self.detail_scroll.hide()
+            self.detail_content.hide()
+            # Use primary background when empty
+            self.detail_panel.setStyleSheet(f"#detailPanel {{ background-color: {t.bg_primary}; }}")
+            return
+
+        self.empty_container.hide()
+        self.detail_scroll.show()
+        self.detail_content.show()
+        # Use primary background for cleaner look
+        self.detail_panel.setStyleSheet(f"#detailPanel {{ background-color: {t.bg_primary}; }}")
+
+        # Handle visibility for header
+        if self.codes_visible:
+            name = self.selected_account.email.split('@')[0] if '@' in self.selected_account.email else self.selected_account.email
+            email = self.selected_account.email
+        else:
+            name = self.selected_account.email.split('@')[0][:3] + "***" if '@' in self.selected_account.email else self.selected_account.email[:3] + "***"
+            local, domain = self.selected_account.email.split('@', 1) if '@' in self.selected_account.email else (self.selected_account.email, "")
+            email = f"{local[:3]}***@{domain}" if domain else f"{local[:3]}***"
+
+        self.detail_name.setText(name)
+        self.detail_email.setText(email)
+
+        self._update_detail_fields()
+
+        # Show/hide TOTP section based on whether account has secret
+        if self.selected_account.secret:
+            self.totp_section.setVisible(True)
+            self._update_totp_display()
+        else:
+            self.totp_section.setVisible(False)
+
+        # Notes section - always show
+        zh = self.state.language == 'zh'
+        self.notes_label.setText("备注" if zh else "Notes")
+        notes = self.selected_account.notes or ""
+        placeholder = "点击添加备注..." if zh else "Click to add notes..."
+        if notes:
+            self.notes_edit.setPlainText(notes)
+            self.notes_edit.setStyleSheet(f"color: {t.text_secondary};")
+        else:
+            self.notes_edit.setPlainText(placeholder)
+            self.notes_edit.setStyleSheet(f"color: {t.text_tertiary};")
+
+    def _update_totp_display(self) -> None:
+        """Update TOTP code display."""
+        if not self.selected_account or not self.selected_account.secret:
+            return
+
+        if not self.codes_visible:
+            self.totp_display.setText("*** ***")
+            return
+
+        code = self.totp_service.generate_code_safe(self.selected_account.secret)
+        if code and len(code) == 6:
+            self.totp_display.setText(f"{code[:3]} {code[3:]}")
+        else:
+            self.totp_display.setText("--- ---")
+
+    def _update_detail_fields(self) -> None:
+        """Update detail fields with copy buttons."""
+        while self.fields_layout.count():
+            child = self.fields_layout.takeAt(0)
+            if child.widget():
+                child.widget().deleteLater()
+
+        # Clear editable fields references
+        self.editable_fields.clear()
+
+        if not self.selected_account:
+            return
+
+        t = get_theme()
+        zh = self.state.language == 'zh'
+
+        # Email field with copy button
+        self._add_copyable_field(
+            "邮箱" if zh else "Email",
+            self.selected_account.email,
+            is_sensitive=True,
+            field_key='email'
+        )
+
+        # Password field with copy button (always show in edit mode, or if has password)
+        if self.selected_account.password or self.detail_edit_mode:
+            self._add_copyable_field(
+                "密码" if zh else "Password",
+                self.selected_account.password or "",
+                is_password=True,
+                is_sensitive=True,
+                field_key='password'
+            )
+
+        # Backup email field with copy button
+        backup_email = getattr(self.selected_account, 'backup', '') or getattr(self.selected_account, 'backup_email', '') or ''
+        if backup_email or self.detail_edit_mode:
+            self._add_copyable_field(
+                "辅助邮箱" if zh else "Backup Email",
+                backup_email,
+                is_sensitive=True,
+                field_key='backup'
+            )
+
+        # 2FA Secret key with copy button (always show in edit mode, or if has secret)
+        if self.selected_account.secret or self.detail_edit_mode:
+            self._add_copyable_field(
+                "2FA密钥" if zh else "2FA Secret",
+                self.selected_account.secret or "",
+                is_password=True,
+                is_sensitive=True,
+                field_key='secret'
+            )
+
+        # Group tags (always show, with edit button)
+        group_widget = QWidget()
+        group_layout = QVBoxLayout(group_widget)
+        group_layout.setContentsMargins(0, 0, 0, 0)
+        group_layout.setSpacing(6)
+
+        # Label row with edit button
+        label_row = QHBoxLayout()
+        label_row.setSpacing(8)
+        group_label = QLabel("分组" if zh else "Group")
+        group_label.setStyleSheet(f"font-size: 11px; font-weight: 500; color: {t.text_tertiary}; text-transform: uppercase; letter-spacing: 0.5px;")
+        label_row.addWidget(group_label)
+        label_row.addStretch()
+        group_layout.addLayout(label_row)
+
+        # Show ALL groups with word wrap - active ones are filled, inactive are outlined
+        # Use a container widget with flow layout behavior
+        tags_container = QWidget()
+        tags_flow = FlowLayout(spacing=6)
+
+        # Tag style - inset effect in dark mode
+        is_dark = get_theme_manager().is_dark
+        inactive_bg = t.bg_primary
+        inactive_hover = t.bg_hover
+
+        for group in self.state.groups:
+            is_active = group.name in self.selected_account.groups
+
+            tag = QPushButton(group.name)
+            tag.setCursor(Qt.CursorShape.PointingHandCursor)
+            tag.setFixedHeight(24)
+
+            if is_active:
+                if is_dark:
+                    # Active tag in dark mode - same gray as library button
+                    tag.setStyleSheet(f"""
+                        QPushButton {{
+                            background-color: #9CA3AF;
+                            color: {t.bg_primary};
+                            padding: 0px 10px;
+                            border: none;
+                            border-radius: 4px;
+                            font-size: 11px;
+                            font-weight: 500;
+                        }}
+                        QPushButton:hover {{
+                            background-color: #D1D5DB;
+                        }}
+                    """)
+                else:
+                    # Active tag in light mode
+                    tag.setStyleSheet(f"""
+                        QPushButton {{
+                            background-color: rgba(120, 120, 128, 0.16);
+                            color: {t.text_primary};
+                            padding: 0px 10px;
+                            border: none;
+                            border-radius: 4px;
+                            font-size: 11px;
+                            font-weight: 500;
+                        }}
+                        QPushButton:hover {{
+                            background-color: rgba(120, 120, 128, 0.22);
+                        }}
+                    """)
+            else:
+                # Inactive tag
+                tag.setStyleSheet(f"""
+                    QPushButton {{
+                        background-color: {inactive_bg};
+                        color: {t.text_tertiary};
+                        padding: 0px 10px;
+                        border: 1px solid {t.border};
+                        border-radius: 4px;
+                        font-size: 11px;
+                        font-weight: 500;
+                    }}
+                    QPushButton:hover {{
+                        background-color: {inactive_hover};
+                        color: {t.text_secondary};
+                    }}
+                """)
+
+            tag.clicked.connect(lambda checked, g=group.name: self._toggle_account_tag(g, g not in self.selected_account.groups))
+            tag.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+            tag.customContextMenuRequested.connect(lambda pos, g=group.name, btn=tag: self._show_tag_context_menu(pos, g, btn))
+            tags_flow.addWidget(tag)
+
+        # Add inline input for new group - compact, auto-expand, match tag height
+        self.new_tag_input = QLineEdit()
+        self.new_tag_input.setPlaceholderText("+")
+        self.new_tag_input.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.new_tag_input.setFixedWidth(36)
+        self.new_tag_input.setFixedHeight(24)
+        self.new_tag_input.setStyleSheet(f"""
+            QLineEdit {{
+                background-color: {t.bg_tertiary};
+                color: {t.text_secondary};
+                border: 1px solid {t.border};
+                border-radius: 4px;
+                font-size: 11px;
+                padding: 0px;
+            }}
+            QLineEdit:focus {{
+                border: 1px solid {t.text_tertiary};
+                background-color: {t.bg_primary};
+                color: {t.text_primary};
+            }}
         """)
-        self._add_color_btn.layout().addWidget(dot)
+        self.new_tag_input.returnPressed.connect(self._create_inline_tag)
+        self.new_tag_input.editingFinished.connect(self._on_tag_input_finished)
+        self.new_tag_input.textChanged.connect(self._on_tag_input_text_changed)
+        tags_flow.addWidget(self.new_tag_input)
 
-    def _build_add_color_menu(self, menu: QMenu, dialog: QDialog) -> None:
-        """Build color selection menu with grid of color circles."""
-        menu.clear()
-        color_names = list(GROUP_COLORS.keys())
+        # Apply flow layout - use content wrapper max width (450) to align with copy button
+        tags_flow.apply_layout(450)
+        tags_container.setLayout(tags_flow)
+        group_layout.addWidget(tags_container)
 
-        grid_widget = QWidget()
-        grid_layout = QGridLayout(grid_widget)
-        grid_layout.setSpacing(6)
-        grid_layout.setContentsMargins(4, 4, 4, 4)
+        self.fields_layout.addWidget(group_widget)
 
-        def make_color_selector(idx):
-            def select():
-                self._selected_color_index = idx
-                self._update_add_color_button_style()
-                menu.close()
-            return select
+    def _add_copyable_field(self, label: str, value: str, is_password: bool = False, is_sensitive: bool = False, display_value: str = None, field_key: str = None) -> None:
+        """Add a field with copy button and optional visibility toggle."""
+        t = get_theme()
 
-        for i, color_name in enumerate(color_names):
-            color_hex = get_color_hex(color_name)
-            pastel_fill = get_pastel_color(color_hex)
-            btn = QPushButton()
-            btn.setFixedSize(28, 28)
-            btn.setCursor(Qt.CursorShape.PointingHandCursor)
-            btn.setStyleSheet(f"""
+        field_widget = QWidget()
+        field_layout = QVBoxLayout(field_widget)
+        field_layout.setContentsMargins(0, 0, 0, 0)
+        field_layout.setSpacing(6)
+
+        field_label = QLabel(label)
+        field_label.setStyleSheet(f"font-size: 11px; font-weight: 500; color: {t.text_tertiary}; text-transform: uppercase; letter-spacing: 0.5px;")
+        field_layout.addWidget(field_label)
+
+        input_row = QHBoxLayout()
+        input_row.setSpacing(8)
+
+        # In edit mode, show actual value for editing
+        if self.detail_edit_mode:
+            display_val = value
+        elif display_value is not None:
+            display_val = display_value
+        elif is_sensitive and not self.codes_visible:
+            if '@' in value:
+                local, domain = value.split('@', 1)
+                display_val = f"{local[:3]}***@{domain}" if len(local) > 3 else f"{local}***@{domain}"
+            else:
+                display_val = "******"
+        else:
+            display_val = value
+
+        field_input = QLineEdit()
+        field_input.setText(display_val)
+
+        # In edit mode: editable with main background color
+        if self.detail_edit_mode:
+            field_input.setReadOnly(False)
+            field_input.setStyleSheet(f"""
+                font-family: 'Consolas', 'Monaco', monospace;
+                font-size: 13px;
+                background-color: {t.bg_primary};
+                border: 1px solid {t.border};
+                border-radius: 6px;
+                padding: 8px 10px;
+                color: {t.text_primary};
+            """)
+            if is_password:
+                field_input.setEchoMode(QLineEdit.EchoMode.Normal)
+        else:
+            field_input.setReadOnly(True)
+            if is_password and self.codes_visible:
+                field_input.setEchoMode(QLineEdit.EchoMode.Password)
+            field_input.setStyleSheet(f"""
+                font-family: 'Consolas', 'Monaco', monospace;
+                font-size: 13px;
+                background-color: {t.bg_tertiary};
+                border: 1px solid {t.border};
+                border-radius: 6px;
+                padding: 8px 10px;
+                color: {t.text_primary};
+            """)
+
+        # Store reference for editing
+        if field_key:
+            self.editable_fields[field_key] = field_input
+
+        input_row.addWidget(field_input, 1)
+
+        # Toggle visibility button (only for password fields when visible)
+        if is_password and self.codes_visible:
+            toggle_btn = QPushButton()
+            toggle_btn.setFixedSize(32, 32)
+            toggle_btn.setIcon(QIcon(icon_eye(14, t.text_secondary)))
+            toggle_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            toggle_btn.setStyleSheet(f"""
                 QPushButton {{
-                    background-color: {pastel_fill};
-                    border: 2px solid #9CA3AF;
+                    background-color: transparent;
+                    border: none;
                     border-radius: 6px;
                 }}
-                QPushButton:hover {{ border-color: #6366F1; border-width: 3px; }}
+                QPushButton:hover {{
+                    background-color: {t.bg_hover};
+                }}
             """)
-            btn.clicked.connect(make_color_selector(i))
-            grid_layout.addWidget(btn, i // 4, i % 4)
 
-        action = QWidgetAction(menu)
-        action.setDefaultWidget(grid_widget)
-        menu.addAction(action)
+            def toggle_visibility():
+                if field_input.echoMode() == QLineEdit.EchoMode.Password:
+                    field_input.setEchoMode(QLineEdit.EchoMode.Normal)
+                    toggle_btn.setIcon(QIcon(icon_eye_off(14, t.text_secondary)))
+                else:
+                    field_input.setEchoMode(QLineEdit.EchoMode.Password)
+                    toggle_btn.setIcon(QIcon(icon_eye(14, t.text_secondary)))
 
-    def _refresh_group_items(self) -> None:
-        """Refresh the group items in the manage dialog."""
-        if not hasattr(self, '_groups_list_widget') or self._groups_list_widget is None:
-            return
-        if self.group_dialog is None:
-            return
+            toggle_btn.clicked.connect(toggle_visibility)
+            input_row.addWidget(toggle_btn)
 
-        self._groups_list_widget.clear()
-
-        for i, group in enumerate(self.state.groups):
-            self._add_group_item_widget(group, i)
-
-        if not self.state.groups:
-            empty_item = QListWidgetItem()
-            empty_text = "暂无分组" if self.state.language == 'zh' else "No groups yet"
-            empty_widget = QLabel(empty_text)
-            empty_widget.setStyleSheet("color: #9CA3AF; padding: 30px; font-size: 14px;")
-            empty_widget.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            empty_item.setSizeHint(empty_widget.sizeHint())
-            empty_item.setFlags(Qt.ItemFlag.NoItemFlags)
-            self._groups_list_widget.addItem(empty_item)
-            self._groups_list_widget.setItemWidget(empty_item, empty_widget)
-
-    def _add_group_item_widget(self, group: Group, index: int) -> None:
-        """Add a single group item widget."""
-        color_names = list(GROUP_COLORS.keys())
-
-        list_item = QListWidgetItem()
-        list_item.setSizeHint(QSize(0, 52))
-        list_item.setData(Qt.ItemDataRole.UserRole, index)
-
-        item_widget = QWidget()
-        item_widget.setStyleSheet("""
-            QWidget {
-                background-color: #FFFFFF;
-                border: 1px solid #E9E9E7;
-                border-radius: 6px;
-            }
-            QWidget:hover {
-                border-color: #37352F;
-                background-color: #FAFAFA;
-            }
-        """)
-        item_layout = QHBoxLayout(item_widget)
-        item_layout.setContentsMargins(8, 8, 12, 8)
-        item_layout.setSpacing(8)
-
-        # Drag handle
-        drag_handle = DragHandle(self._groups_list_widget, list_item)
-        item_layout.addWidget(drag_handle)
-
-        # Color selector button
-        color_btn = QPushButton()
-        color_btn.setFixedSize(32, 32)
-        color_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-
-        current_color = group.color
-        color_hex = get_color_hex(current_color)
-        pastel_fill = get_pastel_color(color_hex)
-
-        color_btn.setStyleSheet(f"""
-            QPushButton {{ background-color: transparent; border: none; }}
-            QPushButton::menu-indicator {{ image: none; width: 0px; }}
-        """)
-
-        btn_layout = QHBoxLayout(color_btn)
-        btn_layout.setContentsMargins(0, 0, 0, 0)
-        btn_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        dot = QLabel()
-        dot.setFixedSize(18, 18)
-        dot.setStyleSheet(f"""
-            background-color: {pastel_fill};
-            border: 1px solid #9CA3AF;
-            border-radius: 4px;
-        """)
-        btn_layout.addWidget(dot)
-
-        # Create color menu for this button - Notion style
-        color_menu = QMenu(self)
-        color_menu.setStyleSheet("""
-            QMenu {
-                background: #FFFFFF;
-                border: 1px solid #E9E9E7;
-                border-radius: 6px;
-                padding: 8px;
-            }
-        """)
-
-        grid_widget = QWidget()
-        grid_layout = QGridLayout(grid_widget)
-        grid_layout.setSpacing(4)
-        grid_layout.setContentsMargins(2, 2, 2, 2)
-
-        def update_edit_color_btn(new_color_hex, btn=color_btn):
-            while btn.layout().count():
-                item = btn.layout().takeAt(0)
-                if item.widget():
-                    item.widget().deleteLater()
-            pastel = get_pastel_color(new_color_hex)
-            new_dot = QLabel()
-            new_dot.setFixedSize(18, 18)
-            new_dot.setStyleSheet(f"background-color: {pastel}; border: 1px solid #9CA3AF; border-radius: 4px;")
-            btn.layout().addWidget(new_dot)
-
-        def make_preset_handler(idx, g_idx, menu_ref):
-            def handler():
-                c = get_color_hex(color_names[idx])
-                self._update_group_color(g_idx, color_names[idx])
-                update_edit_color_btn(c)
-                menu_ref.close()
-            return handler
-
-        for i, cn in enumerate(color_names):
-            ch = get_color_hex(cn)
-            pastel = get_pastel_color(ch)
-            b = QPushButton()
-            b.setFixedSize(24, 24)
-            b.setCursor(Qt.CursorShape.PointingHandCursor)
-            b.setStyleSheet(f"""
-                QPushButton {{ background-color: {pastel}; border: 2px solid #9CA3AF; border-radius: 5px; }}
-                QPushButton:hover {{ border-color: #6366F1; }}
-            """)
-            b.clicked.connect(make_preset_handler(i, index, color_menu))
-            grid_layout.addWidget(b, i // 4, i % 4)
-
-        action = QWidgetAction(color_menu)
-        action.setDefaultWidget(grid_widget)
-        color_menu.addAction(action)
-
-        color_btn.setMenu(color_menu)
-        item_layout.addWidget(color_btn)
-
-        # Name input - Notion style
-        name_input = QLineEdit()
-        name_input.setText(group.name)
-        name_input.setFixedHeight(32)
-        name_input.setStyleSheet("""
-            QLineEdit {
-                font-size: 13px;
-                border: 1px solid #E9E9E7;
-                border-radius: 4px;
-                background-color: #FBFBFA;
-                padding: 4px 8px;
-                color: #37352F;
-            }
-            QLineEdit:focus { border-color: #37352F; background-color: white; }
-        """)
-        name_input.textChanged.connect(lambda text, idx=index: self._update_group_name(idx, text.strip()))
-        item_layout.addWidget(name_input, 1)
-
-        # Delete button
-        btn_delete = QPushButton()
-        btn_delete.setFixedSize(28, 28)
-        btn_delete.setCursor(Qt.CursorShape.PointingHandCursor)
-        btn_delete.setIcon(QIcon(create_trash_icon(16, '#EF4444')))
-        btn_delete.setIconSize(QSize(16, 16))
-        btn_delete.setStyleSheet("""
-            QPushButton { background: transparent; border: none; }
-            QPushButton:hover { background-color: #FEF2F2; border-radius: 6px; }
-        """)
-        btn_delete.clicked.connect(lambda checked, idx=index: self._delete_group_at(idx))
-        item_layout.addWidget(btn_delete)
-
-        self._groups_list_widget.addItem(list_item)
-        self._groups_list_widget.setItemWidget(list_item, item_widget)
-
-    def _update_group_color(self, index: int, new_color: str) -> None:
-        """Update group color."""
-        if index < len(self.state.groups):
-            self.state.groups[index].color = new_color
-            self._save_data()
-            self._load_accounts_to_table()
-            self._refresh_group_list()
-
-    def _update_group_name(self, index: int, new_name: str) -> None:
-        """Update group name."""
-        if index < len(self.state.groups) and new_name:
-            old_name = self.state.groups[index].name
-            if old_name != new_name:
-                # Update accounts with this group
-                for acc in self.state.accounts:
-                    if old_name in acc.groups:
-                        acc.groups.remove(old_name)
-                        acc.groups.append(new_name)
-                self.state.groups[index].name = new_name
-                self._save_data()
-                self._load_accounts_to_table()
-                self._refresh_group_list()
-
-    def _delete_group_at(self, index: int) -> None:
-        """Delete group at index with confirmation and undo support."""
-        if index < len(self.state.groups):
-            group = self.state.groups[index]
-
-            reply = QMessageBox.question(
-                self,
-                self.tr('confirm_delete_group'),
-                self.tr('confirm_delete_group_msg').format(group.name),
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No
-            )
-
-            if reply != QMessageBox.StandardButton.Yes:
-                return
-
-            # Backup for undo - store affected accounts
-            affected_accounts = []
-            for acc in self.state.accounts:
-                if group.name in acc.groups:
-                    affected_accounts.append(acc.id or acc.email)
-                    acc.groups.remove(group.name)
-
-            # Store backup (make a copy of the group)
-            self.deleted_group_backup = {
-                'group': Group(name=group.name, color=group.color),
-                'index': index,
-                'affected_accounts': affected_accounts
-            }
-
-            # Remove group
-            self.state.groups.pop(index)
-            self._save_data()
-            self._load_accounts_to_table()
-            self._refresh_group_list()
-            self._refresh_group_items()
-
-            # Show undo toast
-            self._show_undo_toast(group.name)
-
-    def _show_undo_toast(self, group_name: str) -> None:
-        """Show toast with undo button for deleted group."""
-        # Hide any existing undo toast first
-        self._hide_undo_toast()
-
-        # Create undo toast as a modeless dialog to appear above modal dialogs
-        self.undo_toast = QDialog()
-        self.undo_toast.setWindowFlags(
-            Qt.WindowType.FramelessWindowHint |
-            Qt.WindowType.WindowStaysOnTopHint |
-            Qt.WindowType.Dialog
-        )
-        self.undo_toast.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
-        self.undo_toast.setModal(False)
-
-        layout = QHBoxLayout(self.undo_toast)
-        layout.setContentsMargins(0, 0, 0, 0)
-
-        # Container with styling
-        container = QWidget()
-        container.setStyleSheet("""
-            QWidget {
-                background-color: #1F2937;
-                border-radius: 20px;
-            }
-        """)
-        container_layout = QHBoxLayout(container)
-        container_layout.setContentsMargins(16, 10, 16, 10)
-        container_layout.setSpacing(12)
-
-        # Message label
-        msg_label = QLabel(self.tr('group_deleted').format(group_name))
-        msg_label.setStyleSheet("color: white; font-size: 13px; font-weight: 500; background: transparent;")
-        container_layout.addWidget(msg_label)
-
-        # Undo button
-        undo_btn = QPushButton(self.tr('undo'))
-        undo_btn.setStyleSheet("""
-            QPushButton {
-                color: #60A5FA;
-                font-size: 13px;
-                font-weight: 700;
-                background: transparent;
+        # Copy button
+        copy_btn = QPushButton()
+        copy_btn.setFixedSize(32, 32)
+        copy_btn.setIcon(QIcon(icon_copy(14, t.text_secondary)))
+        copy_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        copy_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: transparent;
                 border: none;
-                padding: 4px 8px;
-            }
-            QPushButton:hover {
-                color: #93C5FD;
-                text-decoration: underline;
-            }
+                border-radius: 6px;
+            }}
+            QPushButton:hover {{
+                background-color: {t.bg_hover};
+            }}
         """)
-        undo_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        undo_btn.clicked.connect(self._undo_delete_group)
-        container_layout.addWidget(undo_btn)
 
-        layout.addWidget(container)
+        def copy_value():
+            QApplication.clipboard().setText(value)
+            copy_btn.setIcon(QIcon(icon_check(14, t.success)))
+            QTimer.singleShot(1500, lambda: copy_btn.setIcon(QIcon(icon_copy(14, t.text_secondary))))
+            zh = self.state.language == 'zh'
+            self.toast.show_message(f"已复制：{label}" if zh else f"Copied: {label}", center=True)
 
-        # Position at bottom center of main window
-        self.undo_toast.adjustSize()
-        parent_rect = self.geometry()
-        toast_x = parent_rect.x() + (parent_rect.width() - self.undo_toast.width()) // 2
-        toast_y = parent_rect.y() + parent_rect.height() - self.undo_toast.height() - 80
-        self.undo_toast.move(toast_x, toast_y)
-        self.undo_toast.show()
-        self.undo_toast.raise_()
+        copy_btn.clicked.connect(copy_value)
+        input_row.addWidget(copy_btn)
 
-        # Auto-hide after 5 seconds
-        QTimer.singleShot(5000, self._hide_undo_toast)
+        field_layout.addLayout(input_row)
+        self.fields_layout.addWidget(field_widget)
 
-    def _hide_undo_toast(self) -> None:
-        """Hide the undo toast."""
-        if self.undo_toast:
-            self.undo_toast.hide()
-            self.undo_toast.deleteLater()
-            self.undo_toast = None
+    def _start_timer(self) -> None:
+        """Start TOTP timer."""
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self._update_timer)
+        self.timer.start(1000)
 
-    def _undo_delete_group(self) -> None:
-        """Restore the last deleted group."""
+    def _update_timer(self) -> None:
+        """Update TOTP timer."""
         try:
-            if not self.deleted_group_backup:
+            remaining = self.time_service.get_remaining_seconds()
+            self.totp_progress.setValue(remaining)
+            self.totp_timer.setText(f"{remaining}s")
+
+            if remaining >= 29:
+                self._update_totp_display()
+                self._refresh_account_list_codes()
+
+            if self.selected_account and self.selected_account.secret:
+                self._update_totp_display()
+
+        except Exception as e:
+            logger.error(f"Timer error: {e}")
+
+    def _refresh_account_list_codes(self) -> None:
+        """Refresh account list display (handles visibility toggle)."""
+        # Since we removed TOTP from cards, just refresh the list on visibility change
+        pass
+
+    # === Event Handlers ===
+
+    def _on_search_changed(self, text: str) -> None:
+        """Handle search input."""
+        self._refresh_account_list(text)
+
+    def _toggle_theme(self) -> None:
+        """Toggle light/dark theme."""
+        self.theme_manager.toggle_theme()
+        self._apply_theme()
+        self._refresh_groups()
+        self._refresh_account_list()
+        self._update_detail_panel()
+        self._save_data()
+
+    def _toggle_language(self) -> None:
+        """Toggle language."""
+        self.state.language = 'en' if self.state.language == 'zh' else 'zh'
+        self._apply_theme()
+        self._refresh_groups()
+        self._refresh_account_list()
+        self._update_detail_panel()
+        self._save_data()
+
+    def _toggle_codes_visibility(self) -> None:
+        """Toggle batch show/hide for all data."""
+        self.codes_visible = not self.codes_visible
+        self._update_icons()
+
+        if self.list_view_mode:
+            self._refresh_table_view()
+        else:
+            self._refresh_account_list()
+            self._update_detail_panel()
+
+        zh = self.state.language == 'zh'
+        if self.codes_visible:
+            self.toast.show_message("已显示数据" if zh else "Data visible")
+        else:
+            self.toast.show_message("已隐藏数据" if zh else "Data hidden")
+
+    def _toggle_multi_select(self) -> None:
+        """Toggle multi-select mode."""
+        self.multi_select_mode = not self.multi_select_mode
+        self.selection_manager.clear()  # Clears selection and resets anchor
+
+        # Clear single selection when entering multi-select mode
+        if self.multi_select_mode:
+            self.selected_account = None
+            self.selected_table_row = -1  # Clear table row selection
+
+        self._update_icons()
+        self._refresh_account_list()
+        self._update_batch_bar()
+        self._update_detail_panel()
+
+        zh = self.state.language == 'zh'
+        if self.multi_select_mode:
+            self.toast.show_message("已开启多选" if zh else "Multi-select on")
+        else:
+            self.toast.show_message("已关闭多选" if zh else "Multi-select off")
+
+    def _exit_multi_select_mode(self) -> None:
+        """Exit multi-select mode silently (without toast)."""
+        if not self.multi_select_mode:
+            return
+        self.multi_select_mode = False
+        self.selection_manager.clear()
+        self._update_icons()
+        self._refresh_account_list()
+        self._update_batch_bar()
+        self._update_detail_panel()
+
+    def _update_batch_bar(self) -> None:
+        """Update batch action bar visibility and label."""
+        self.batch_action_bar.setVisible(self.multi_select_mode)
+        if self.multi_select_mode:
+            t = get_theme()
+            zh = self.state.language == 'zh'
+            count = self.selection_manager.count
+            total = len(self._get_filtered_accounts())
+
+            # Update select all icon button
+            if count == total and total > 0:
+                # All selected - show checked icon
+                self.select_all_btn.setIcon(QIcon(icon_checkbox(16, t.text_secondary)))
+            else:
+                # Not all selected - show empty icon
+                self.select_all_btn.setIcon(QIcon(icon_checkbox_empty(16, t.text_tertiary)))
+
+            if count > 0:
+                self.batch_select_label.setText(f"已选择 {count}/{total} 项" if zh else f"{count}/{total} selected")
+            else:
+                self.batch_select_label.setText(f"全选 ({total})" if zh else f"Select all ({total})")
+
+    def _on_select_all_changed(self, state: int) -> None:
+        """Handle select all checkbox state change (legacy, kept for compatibility)."""
+        filtered = self._get_filtered_accounts()
+        if state == 2:  # Checked - select all
+            self.selection_manager.set_all(filtered)
+        else:  # Unchecked - deselect all
+            self.selection_manager.clear()
+        self._refresh_account_list()
+        self._update_batch_bar()
+
+    def _on_select_all_btn_clicked(self) -> None:
+        """Handle select all icon button click."""
+        filtered = self._get_filtered_accounts()
+        count = self.selection_manager.count
+        total = len(filtered)
+
+        if count == total and total > 0:
+            # All selected - deselect all
+            self.selection_manager.clear()
+        else:
+            # Not all selected - select all
+            self.selection_manager.set_all(filtered)
+
+        self._refresh_account_list()
+        self._update_batch_bar()
+
+    def _handle_notes_click(self) -> None:
+        """Handle notes field click to enable editing."""
+        try:
+            if not hasattr(self, 'notes_edit') or not self.notes_edit:
                 return
 
-            backup = self.deleted_group_backup
+            t = get_theme()
+            zh = self.state.language == 'zh'
+            placeholder = "点击添加备注..." if zh else "Click to add notes..."
 
-            # Restore group at original position
-            index = min(backup['index'], len(self.state.groups))
-            self.state.groups.insert(index, backup['group'])
+            # Clear placeholder text when clicking
+            if self.notes_edit.toPlainText() == placeholder:
+                self.notes_edit.clear()
+                self.notes_edit.setStyleSheet(f"color: {t.text_secondary};")
 
-            # Restore group to affected accounts
-            group_name = backup['group'].name
-            for acc in self.state.accounts:
-                acc_id = acc.id or acc.email
-                if acc_id in backup['affected_accounts']:
-                    if group_name not in acc.groups:
-                        acc.groups.append(group_name)
-
-            # Clear backup
-            self.deleted_group_backup = None
-
-            # Save and refresh
-            self._save_data()
-            self._load_accounts_to_table()
-            self._refresh_group_list()
-
-            # Only refresh group items if dialog is still open and valid
-            try:
-                if self.group_dialog is not None and self.group_dialog.isVisible():
-                    self._refresh_group_items()
-            except RuntimeError:
-                pass  # Widget was deleted
-
-            # Hide undo toast
-            self._hide_undo_toast()
-
-            # Show confirmation
-            self.toast.show_message(f"✓ {group_name}", self)
+            self.notes_edit.setReadOnly(False)
+            self.notes_edit.setCursor(Qt.CursorShape.IBeamCursor)
+        except RuntimeError:
+            pass
         except Exception as e:
-            logger.error(f"Undo error: {e}")
+            logger.error(f"Error in notes click: {e}")
 
-    def _on_groups_reordered(self) -> None:
-        """Handle group reordering after drag and drop."""
-        if not hasattr(self, '_groups_list_widget'):
+    def _handle_notes_focus_out(self) -> None:
+        """Handle notes field focus out to save changes."""
+        try:
+            # Check if widget still exists
+            if not hasattr(self, 'notes_edit') or not self.notes_edit:
+                return
+
+            t = get_theme()
+            zh = self.state.language == 'zh'
+            placeholder = "点击添加备注..." if zh else "Click to add notes..."
+
+            if self.selected_account:
+                new_notes = self.notes_edit.toPlainText().strip()
+                # Don't save placeholder as notes
+                if new_notes == placeholder:
+                    new_notes = ""
+                if new_notes != self.selected_account.notes:
+                    self.selected_account.notes = new_notes
+                    self._save_data()
+
+                # Restore placeholder if empty
+                if not new_notes:
+                    self.notes_edit.setPlainText(placeholder)
+                    self.notes_edit.setStyleSheet(f"color: {t.text_tertiary};")
+
+            self.notes_edit.setReadOnly(True)
+            self.notes_edit.setCursor(Qt.CursorShape.PointingHandCursor)
+        except RuntimeError:
+            # Widget was deleted
+            pass
+        except Exception as e:
+            logger.error(f"Error in notes focus out: {e}")
+
+    def _batch_delete(self) -> None:
+        """Delete selected accounts with undo support."""
+        if self.selection_manager.count == 0:
             return
 
-        new_order = []
-        for i in range(self._groups_list_widget.count()):
-            item = self._groups_list_widget.item(i)
-            if item:
-                original_index = item.data(Qt.ItemDataRole.UserRole)
-                if original_index is not None and original_index < len(self.state.groups):
-                    new_order.append(self.state.groups[original_index])
+        zh = self.state.language == 'zh'
+        count = self.selection_manager.count
+        msg = f"确定要删除 {count} 个账户吗？" if zh else f"Delete {count} accounts?"
 
-        if len(new_order) == len(self.state.groups):
-            self.state.groups = new_order
+        if not self._show_delete_confirmation(msg):
+            return
+
+        # Store deleted accounts for undo
+        deleted_accounts = list(self.selection_manager.items)
+        was_selected = self.selected_account
+        selected_was_deleted = self.selection_manager.is_selected(self.selected_account)
+
+        for account in deleted_accounts:
+            if hasattr(self.state, 'trash'):
+                self.state.trash.append(account)
+            if account in self.state.accounts:
+                self.state.accounts.remove(account)
+
+        # Clear selected account if it was deleted
+        if selected_was_deleted:
+            self.selected_account = None
+
+        self.selection_manager.clear()
+        self._save_data()
+        self._refresh_groups()
+        self._refresh_account_list()
+        self._update_batch_bar()
+        self._update_detail_panel()
+
+        # Undo callback
+        def undo_delete():
+            for account in deleted_accounts:
+                if hasattr(self.state, 'trash') and account in self.state.trash:
+                    self.state.trash.remove(account)
+                self.state.accounts.append(account)
+            if selected_was_deleted and was_selected:
+                self.selected_account = was_selected
             self._save_data()
-            self._refresh_group_list()
-            self._refresh_group_items()
+            self._refresh_groups()
+            self._refresh_account_list()
+            self._update_detail_panel()
+            self.toast.show_message(f"已恢复 {count} 个账户" if zh else f"Restored {count} accounts")
 
-    def _show_trash(self) -> None:
-        """Show trash dialog with table and checkboxes."""
-        if not self.state.trash:
-            QMessageBox.information(
-                self, self.tr('trash_empty'), self.tr('trash_empty_msg')
-            )
+        # Exit multi-select mode
+        self._exit_multi_select_mode()
+
+        # Show toast with undo
+        self.toast.show_message(
+            f"已删除 {count} 个账户" if zh else f"Deleted {count} accounts",
+            duration=4000,
+            action_text="撤回" if zh else "Undo",
+            action_callback=undo_delete
+        )
+
+    def _batch_export(self) -> None:
+        """Export selected accounts."""
+        if self.selection_manager.count == 0:
             return
+
+        zh = self.state.language == 'zh'
+
+        # Build export text
+        lines = []
+        for account in self.selection_manager.items:
+            parts = [account.email]
+            if account.password:
+                parts.append(account.password)
+            if hasattr(account, 'backup_email') and account.backup_email:
+                parts.append(account.backup_email)
+            if account.secret:
+                parts.append(account.secret)
+            lines.append("----".join(parts))
+
+        export_text = "\n".join(lines)
+        QApplication.clipboard().setText(export_text)
+
+        count = self.selection_manager.count
+
+        # Exit multi-select mode
+        self._exit_multi_select_mode()
+
+        self.toast.show_message(f"已复制 {count} 个账户" if zh else f"Copied {count} accounts", center=True)
+
+    def _should_show_menu(self, menu_id: str) -> bool:
+        """Check if menu should be shown (prevents re-open when clicking to close)."""
+        last_close = self._menu_close_times.get(menu_id, 0)
+        return time.time() - last_close > 0.3  # 300ms threshold
+
+    def _track_menu_close(self, menu: QMenu, menu_id: str) -> None:
+        """Track when menu closes."""
+        menu.aboutToHide.connect(lambda: self._menu_close_times.update({menu_id: time.time()}))
+
+    def _show_batch_add_group_menu(self) -> None:
+        """Show menu to add selected accounts to a group."""
+        if not self._should_show_menu("batch_add_group"):
+            return
+
+        if self.selection_manager.count == 0:
+            zh = self.state.language == 'zh'
+            self.toast.show_message("请先选择账户" if zh else "Please select accounts first")
+            return
+
+        t = get_theme()
+        zh = self.state.language == 'zh'
+
+        menu_style = f"""
+            QMenu {{
+                background-color: {t.bg_secondary};
+                border: 1px solid {t.border};
+                border-radius: 8px;
+                padding: 4px;
+            }}
+            QMenu::item {{
+                padding: 8px 16px;
+                border-radius: 4px;
+                color: {t.text_primary};
+            }}
+            QMenu::item:selected {{
+                background-color: {t.bg_hover};
+            }}
+        """
+
+        menu = QMenu(self)
+        menu.setStyleSheet(menu_style)
+        self._track_menu_close(menu, "batch_add_group")
+
+        for group in self.state.groups:
+            action = menu.addAction(f"■ {group.name}")
+            action.triggered.connect(lambda checked, g=group.name: self._batch_add_to_group(g))
+
+        if self.state.groups:
+            menu.addSeparator()
+
+        new_action = menu.addAction("+ " + ("新建分组" if zh else "New group"))
+        new_action.triggered.connect(self._batch_add_to_new_group)
+
+        # Show menu below button
+        menu.exec(self.btn_batch_add_group.mapToGlobal(self.btn_batch_add_group.rect().bottomLeft()))
+
+    def _show_batch_remove_group_menu(self) -> None:
+        """Show menu to remove selected accounts from a group."""
+        if not self._should_show_menu("batch_remove_group"):
+            return
+
+        if self.selection_manager.count == 0:
+            zh = self.state.language == 'zh'
+            self.toast.show_message("请先选择账户" if zh else "Please select accounts first")
+            return
+
+        # Collect groups from selected accounts
+        groups_in_selection = set()
+        for account in self.selection_manager.items:
+            for g in account.groups:
+                groups_in_selection.add(g)
+
+        if not groups_in_selection:
+            zh = self.state.language == 'zh'
+            self.toast.show_message("所选账户不在任何分组中" if zh else "Selected accounts are not in any group")
+            return
+
+        t = get_theme()
+        zh = self.state.language == 'zh'
+
+        menu_style = f"""
+            QMenu {{
+                background-color: {t.bg_secondary};
+                border: 1px solid {t.border};
+                border-radius: 8px;
+                padding: 4px;
+            }}
+            QMenu::item {{
+                padding: 8px 16px;
+                border-radius: 4px;
+                color: {t.text_primary};
+            }}
+            QMenu::item:selected {{
+                background-color: {t.bg_hover};
+            }}
+        """
+
+        menu = QMenu(self)
+        menu.setStyleSheet(menu_style)
+        self._track_menu_close(menu, "batch_remove_group")
+
+        for group_name in sorted(groups_in_selection):
+            action = menu.addAction(f"■ {group_name}")
+            action.triggered.connect(lambda checked, g=group_name: self._batch_remove_from_group(g))
+
+        # Show menu below button
+        menu.exec(self.btn_batch_remove_group.mapToGlobal(self.btn_batch_remove_group.rect().bottomLeft()))
+
+    def _show_batch_move_library_menu(self) -> None:
+        """Show menu to move/copy selected accounts to another library."""
+        if not self._should_show_menu("batch_move_library"):
+            return
+
+        zh = self.state.language == 'zh'
+
+        if self.selection_manager.count == 0:
+            self.toast.show_message("请先选择账户" if zh else "Please select accounts first")
+            return
+
+        # Get other libraries
+        from ..services.library_service import get_library_service
+        library_service = get_library_service()
+        libraries = library_service.list_libraries()
+        current_library = library_service.get_current_library()
+        other_libraries = [lib for lib in libraries if lib.id != current_library.id]
+
+        if not other_libraries:
+            self.toast.show_message("没有其他库可用" if zh else "No other libraries available")
+            return
+
+        t = get_theme()
+
+        menu_style = f"""
+            QMenu {{
+                background-color: {t.bg_secondary};
+                border: 1px solid {t.border};
+                border-radius: 8px;
+                padding: 4px;
+            }}
+            QMenu::item {{
+                padding: 8px 16px;
+                border-radius: 4px;
+                color: {t.text_primary};
+            }}
+            QMenu::item:selected {{
+                background-color: {t.bg_hover};
+            }}
+        """
+
+        menu = QMenu(self)
+        menu.setStyleSheet(menu_style)
+        self._track_menu_close(menu, "batch_move_library")
+
+        # Get icon color
+        is_dark = get_theme_manager().is_dark
+        ic = t.text_secondary
+
+        for lib in other_libraries:
+            # Create submenu for each library with library icon
+            lib_menu = menu.addMenu(QIcon(icon_library(14, ic)), lib.name)
+            lib_menu.setStyleSheet(menu_style)
+
+            # Move option (remove from current library)
+            move_action = lib_menu.addAction("移动" if zh else "Move")
+            move_action.triggered.connect(lambda checked, l=lib: self._batch_move_to_library(l, remove_from_current=True))
+
+            # Copy option (keep in both libraries)
+            copy_action = lib_menu.addAction("复制" if zh else "Copy")
+            copy_action.triggered.connect(lambda checked, l=lib: self._batch_move_to_library(l, remove_from_current=False))
+
+        # Show menu below button
+        menu.exec(self.btn_batch_move_library.mapToGlobal(self.btn_batch_move_library.rect().bottomLeft()))
+
+    def _batch_move_to_library(self, target_library, remove_from_current: bool = True) -> None:
+        """Move or copy selected accounts to another library with undo support."""
+        if self.selection_manager.count == 0:
+            return
+
+        zh = self.state.language == 'zh'
+
+        try:
+            from ..services.library_service import get_library_service
+            from ..models.group import Group
+            import copy as copy_module
+
+            library_service = get_library_service()
+
+            # Load target library state
+            target_state = library_service.load_library_state(target_library)
+
+            # Get existing group names in target library
+            target_group_names = {g.name for g in target_state.groups}
+
+            # Store for undo
+            moved_accounts = []
+            moved_emails = []
+            was_selected = self.selected_account
+            selected_was_moved = self.selection_manager.is_selected(self.selected_account)
+
+            # Copy accounts to target library
+            count = 0
+            for account in self.selection_manager.items:
+                # Deep copy the account to avoid reference issues
+                account_copy = copy_module.deepcopy(account)
+                # Check if account already exists in target (by email)
+                if not any(a.email == account_copy.email for a in target_state.accounts):
+                    target_state.accounts.append(account_copy)
+                    moved_accounts.append(account)
+                    moved_emails.append(account.email)
+                    count += 1
+
+                    # Create missing groups in target library
+                    for group_name in account_copy.groups:
+                        if group_name not in target_group_names:
+                            # Find the group color from source library
+                            source_group = next((g for g in self.state.groups if g.name == group_name), None)
+                            color = source_group.color if source_group else "red"
+                            target_state.groups.append(Group(name=group_name, color=color))
+                            target_group_names.add(group_name)
+
+            # Save target library
+            library_service.save_library_state(target_library, target_state)
+
+            # Remove from current library if it's a move operation
+            if remove_from_current:
+                for account in moved_accounts:
+                    if account in self.state.accounts:
+                        self.state.accounts.remove(account)
+
+                # Clear selection
+                if selected_was_moved:
+                    self.selected_account = None
+                self.selection_manager.clear()
+
+                self._save_data()
+                self._refresh_groups()
+                self._refresh_account_list()
+                self._update_batch_bar()
+                self._update_detail_panel()
+
+                action_text = "移动" if zh else "Moved"
+            else:
+                action_text = "复制" if zh else "Copied"
+
+            # Exit multi-select mode
+            self._exit_multi_select_mode()
+
+            # Undo callback
+            def undo_move():
+                try:
+                    # Reload target library state
+                    target_state_now = library_service.load_library_state(target_library)
+                    # Remove moved accounts from target
+                    target_state_now.accounts = [a for a in target_state_now.accounts if a.email not in moved_emails]
+                    library_service.save_library_state(target_library, target_state_now)
+
+                    # Restore to current library if it was a move
+                    if remove_from_current:
+                        for account in moved_accounts:
+                            if not any(a.email == account.email for a in self.state.accounts):
+                                self.state.accounts.append(account)
+                        if selected_was_moved and was_selected:
+                            self.selected_account = was_selected
+                        self._save_data()
+                        self._refresh_groups()
+                        self._refresh_account_list()
+                        self._update_detail_panel()
+
+                    self.toast.show_message(f"已撤销" if zh else "Undone")
+                except Exception as e:
+                    logger.error(f"Undo move failed: {e}")
+                    self.toast.show_message("撤销失败" if zh else "Undo failed")
+
+            # Show toast with undo
+            self.toast.show_message(
+                f"已{action_text} {count} 个账户到「{target_library.name}」" if zh else f"{action_text} {count} accounts to '{target_library.name}'",
+                duration=4000,
+                action_text="撤回" if zh else "Undo",
+                action_callback=undo_move
+            )
+
+        except Exception as e:
+            logger.error(f"Failed to move/copy accounts: {e}")
+            self.toast.show_message("操作失败" if zh else "Operation failed")
+
+    def _move_account_to_library(self, account: Account, target_library, remove_from_current: bool = True) -> None:
+        """Move or copy a single account to another library."""
+        zh = self.state.language == 'zh'
+        try:
+            from ..services.library_service import get_library_service
+            from ..models.group import Group
+            import copy
+
+            library_service = get_library_service()
+
+            # Load target library state
+            target_state = library_service.load_library_state(target_library)
+
+            # Check if account already exists in target (by email)
+            if any(a.email == account.email for a in target_state.accounts):
+                self.toast.show_message("账户已存在于目标库" if zh else "Account already exists in target library")
+                return
+
+            # Deep copy the account
+            account_copy = copy.deepcopy(account)
+            target_state.accounts.append(account_copy)
+
+            # Create missing groups in target library
+            target_group_names = {g.name for g in target_state.groups}
+            for group_name in account_copy.groups:
+                if group_name not in target_group_names:
+                    # Find the group color from source library
+                    source_group = next((g for g in self.state.groups if g.name == group_name), None)
+                    color = source_group.color if source_group else "red"
+                    target_state.groups.append(Group(name=group_name, color=color))
+                    target_group_names.add(group_name)
+
+            # Save target library
+            library_service.save_library_state(target_library, target_state)
+
+            # Remove from current library if it's a move operation
+            if remove_from_current:
+                if account in self.state.accounts:
+                    self.state.accounts.remove(account)
+                if self.selected_account == account:
+                    self.selected_account = None
+                self._save_data()
+                self._refresh_groups()
+                self._refresh_account_list()
+                self._update_detail_panel()
+                action_text = "移动" if zh else "Moved"
+            else:
+                action_text = "复制" if zh else "Copied"
+
+            self.toast.show_message(f"已{action_text}到「{target_library.name}」" if zh else f"{action_text} to '{target_library.name}'")
+
+        except Exception as e:
+            logger.error(f"Failed to move/copy account: {e}")
+            self.toast.show_message("操作失败" if zh else "Operation failed")
+
+    def _batch_add_to_group(self, group_name: str) -> None:
+        """Add selected accounts to a group."""
+        if self.selection_manager.count == 0:
+            return
+
+        count = 0
+        for account in self.selection_manager.items:
+            if group_name not in account.groups:
+                account.groups.append(group_name)
+                count += 1
+
+        if count > 0:
+            self._save_data()
+            self._refresh_account_list()
+            self._update_detail_panel()
+            self._refresh_groups()
+
+            # Exit multi-select mode
+            self._exit_multi_select_mode()
+
+            zh = self.state.language == 'zh'
+            self.toast.show_message(f"已添加 {count} 个账户到「{group_name}」" if zh else f"Added {count} accounts to '{group_name}'")
+
+    def _batch_add_to_new_group(self) -> None:
+        """Create a new group and add selected accounts to it."""
+        zh = self.state.language == 'zh'
+
+        name, ok = QInputDialog.getText(
+            self,
+            "新建分组" if zh else "New Group",
+            "分组名称:" if zh else "Group name:"
+        )
+
+        if ok and name.strip():
+            name = name.strip()
+            # Check if group already exists
+            if any(g.name == name for g in self.state.groups):
+                self.toast.show_message(f"分组「{name}」已存在" if zh else f"Group '{name}' already exists")
+                return
+
+            # Create new group
+            new_group = Group(name=name, color="blue")
+            self.state.groups.append(new_group)
+
+            # Add selected accounts to this group
+            self._batch_add_to_group(name)
+
+    def _batch_remove_from_group(self, group_name: str) -> None:
+        """Remove selected accounts from a group with undo support."""
+        if self.selection_manager.count == 0:
+            return
+
+        zh = self.state.language == 'zh'
+
+        # Store affected accounts for undo
+        affected_accounts = []
+        for account in self.selection_manager.items:
+            if group_name in account.groups:
+                affected_accounts.append(account)
+                account.groups.remove(group_name)
+
+        count = len(affected_accounts)
+        if count > 0:
+            self._save_data()
+            self._refresh_account_list()
+            self._update_detail_panel()
+            self._refresh_groups()
+
+            # Exit multi-select mode
+            self._exit_multi_select_mode()
+
+            # Undo callback
+            def undo_remove():
+                for account in affected_accounts:
+                    if group_name not in account.groups:
+                        account.groups.append(group_name)
+                self._save_data()
+                self._refresh_account_list()
+                self._update_detail_panel()
+                self._refresh_groups()
+                self.toast.show_message("已撤销" if zh else "Undone")
+
+            # Show toast with undo
+            self.toast.show_message(
+                f"已从「{group_name}」移除 {count} 个账户" if zh else f"Removed {count} accounts from '{group_name}'",
+                duration=4000,
+                action_text="撤回" if zh else "Undo",
+                action_callback=undo_remove
+            )
+
+    def _batch_copy(self) -> None:
+        """Copy selected accounts info to clipboard in import format."""
+        zh = self.state.language == 'zh'
+
+        if self.selection_manager.count == 0:
+            self.toast.show_message("请先选择账户" if zh else "Please select accounts first")
+            return
+
+        try:
+            # Header line (template format)
+            header = "邮箱----密码----辅助邮箱----2FA密钥" if zh else "email----password----backup_email----2fa_secret"
+
+            lines = [header]
+            for account in self.selection_manager.items:
+                parts = [account.email or ""]
+                parts.append(account.password or "")
+                parts.append(getattr(account, 'backup_email', '') or "")
+                parts.append(account.secret or "")
+                lines.append("----".join(parts))
+
+            text = '\n'.join(lines)
+            QApplication.clipboard().setText(text)
+            count = self.selection_manager.count
+
+            # Exit multi-select mode
+            self._exit_multi_select_mode()
+
+            self.toast.show_message(f"已复制 {count} 个账户" if zh else f"Copied {count} accounts", center=True)
+        except Exception as e:
+            logger.error(f"Batch copy failed: {e}")
+            self.toast.show_message("复制失败" if zh else "Copy failed")
+
+    def _toggle_view_mode(self) -> None:
+        """Toggle between list and card view."""
+        self.list_view_mode = not self.list_view_mode
+        self._update_icons()
+
+        zh = self.state.language == 'zh'
+        if self.list_view_mode:
+            # List view: hide detail panel and card view, show full-width table
+            self.selected_account = None
+            self.detail_panel.hide()
+            self.card_view_scroll.hide()
+            self.list_panel.setMinimumWidth(0)
+            self.list_panel.setMaximumWidth(16777215)  # QWIDGETSIZE_MAX
+            self.table_view.show()
+            self._refresh_table_view()
+            self.toast.show_message("列表视图" if zh else "List view")
+        else:
+            # Card view: show detail panel and card view, hide table
+            self.table_view.hide()
+            self.list_panel.setFixedWidth(320)
+            self.card_view_scroll.show()
+            self.detail_panel.show()
+            self._update_detail_panel()
+            self._refresh_account_list()
+            self.toast.show_message("卡片视图" if zh else "Card view")
+
+    def _refresh_table_view(self) -> None:
+        """Refresh the table view with current accounts."""
+        t = get_theme()
+        zh = self.state.language == 'zh'
+
+        # Clear all existing cell widgets to prevent stale signal connections
+        for row in range(self.table_view.rowCount()):
+            for col in range(self.table_view.columnCount()):
+                widget = self.table_view.cellWidget(row, col)
+                if widget:
+                    self.table_view.removeCellWidget(row, col)
+                    widget.deleteLater()
+
+        # Set headers based on multi-select mode
+        first_col = "" if self.multi_select_mode else "#"
+        headers = [first_col, "邮箱" if zh else "Email", "密码" if zh else "Password",
+                   "辅助邮箱" if zh else "Backup", "2FA密钥" if zh else "2FA Key",
+                   "验证码" if zh else "Code", "分组" if zh else "Groups",
+                   "备注" if zh else "Notes"]
+        self.table_view.setHorizontalHeaderLabels(headers)
+
+        # Get filtered accounts
+        accounts = self._get_filtered_accounts()
+        self.table_view.setRowCount(len(accounts))
+
+        # Store accounts list for reference
+        self._table_accounts = accounts
+
+        # Adjust first column width based on mode
+        if self.multi_select_mode:
+            self.table_view.setColumnWidth(0, 80)  # Wider for checkbox + ID
+        else:
+            self.table_view.setColumnWidth(0, 50)  # Just ID
+
+        for row, account in enumerate(accounts):
+            # First column: ID (with checkbox in multi-select mode)
+            if self.multi_select_mode:
+                # Checkbox + ID widget
+                first_col_widget = QWidget()
+                first_col_layout = QHBoxLayout(first_col_widget)
+                first_col_layout.setContentsMargins(8, 0, 4, 0)
+                first_col_layout.setSpacing(6)
+                first_col_layout.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+
+                check_btn = QToolButton()
+                check_btn.setFixedSize(18, 18)
+                check_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+                is_checked = self.selection_manager.is_selected(account)
+                check_btn.setIcon(QIcon(icon_checkbox(14, t.text_secondary) if is_checked else icon_checkbox_empty(14, t.text_tertiary)))
+                check_btn.setStyleSheet("QToolButton { background: transparent; border: none; }")
+                check_btn.clicked.connect(lambda checked, a=account, r=row: self._on_table_checkbox_clicked(a, r))
+                first_col_layout.addWidget(check_btn)
+
+                id_label = QLabel(f"#{row + 1}")
+                id_label.setStyleSheet(f"color: {t.text_tertiary}; font-size: 12px;")
+                first_col_layout.addWidget(id_label)
+
+                self.table_view.setCellWidget(row, 0, first_col_widget)
+                # Set empty item for background handling
+                id_item = QTableWidgetItem()
+                id_item.setData(Qt.ItemDataRole.UserRole + 1, account)
+                self.table_view.setItem(row, 0, id_item)
+            else:
+                # ID number only
+                self.table_view.removeCellWidget(row, 0)
+                id_item = QTableWidgetItem(f"#{row + 1}")
+                id_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                id_item.setForeground(QColor(t.text_tertiary))
+                id_item.setData(Qt.ItemDataRole.UserRole + 1, account)
+                self.table_view.setItem(row, 0, id_item)
+
+            # Email column
+            email_display = account.email if self.codes_visible else self._mask_email(account.email)
+            email_item = QTableWidgetItem(email_display)
+            email_item.setData(Qt.ItemDataRole.UserRole, account.email)
+            email_item.setData(Qt.ItemDataRole.UserRole + 1, account)
+            email_item.setForeground(QColor(t.text_primary))
+            self.table_view.setItem(row, 1, email_item)
+
+            # Password column
+            pwd_display = account.password if self.codes_visible else ("••••••••" if account.password else "-")
+            pwd_item = QTableWidgetItem(pwd_display)
+            pwd_item.setData(Qt.ItemDataRole.UserRole, account.password)
+            pwd_item.setForeground(QColor(t.text_secondary))
+            self.table_view.setItem(row, 2, pwd_item)
+
+            # Backup email column
+            backup = getattr(account, 'backup', '') or getattr(account, 'backup_email', '') or ''
+            backup_display = backup if self.codes_visible else (self._mask_email(backup) if backup else "-")
+            backup_item = QTableWidgetItem(backup_display if backup else "-")
+            backup_item.setData(Qt.ItemDataRole.UserRole, backup)
+            backup_item.setForeground(QColor(t.text_secondary))
+            self.table_view.setItem(row, 3, backup_item)
+
+            # 2FA Key column
+            secret_display = account.secret[:8] + "..." if account.secret and self.codes_visible else ("••••••••" if account.secret else "-")
+            secret_item = QTableWidgetItem(secret_display)
+            secret_item.setData(Qt.ItemDataRole.UserRole, account.secret)
+            secret_item.setForeground(QColor(t.text_secondary))
+            self.table_view.setItem(row, 4, secret_item)
+
+            # Code column
+            if account.secret:
+                code = self.totp_service.generate_code_safe(account.secret)
+                code_display = f"{code[:3]} {code[3:]}" if code and len(code) == 6 and self.codes_visible else "*** ***"
+            else:
+                code_display = "-"
+                code = ""
+            code_item = QTableWidgetItem(code_display)
+            code_item.setData(Qt.ItemDataRole.UserRole, code)
+            code_item.setForeground(QColor(t.success if account.secret else t.text_tertiary))
+            self.table_view.setItem(row, 5, code_item)
+
+            # Groups column - display as small tags (same style as card view)
+            is_dark = get_theme_manager().is_dark
+            groups_widget = QWidget()
+            groups_widget.setObjectName(f"groupsWidget_{row}")
+            groups_layout = QHBoxLayout(groups_widget)
+            groups_layout.setContentsMargins(8, 0, 8, 0)
+            groups_layout.setSpacing(4)
+            groups_layout.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+
+            if account.groups:
+                for group_name in account.groups[:5]:  # Max 5 tags
+                    tag_label = QLabel(group_name)
+                    tag_label.setFixedHeight(18)
+                    if is_dark:
+                        tag_label.setStyleSheet("""
+                            QLabel {
+                                background-color: #9CA3AF;
+                                color: #111827;
+                                padding: 0px 6px;
+                                border: none;
+                                border-radius: 3px;
+                                font-size: 10px;
+                                font-weight: 500;
+                            }
+                        """)
+                    else:
+                        tag_label.setStyleSheet(f"""
+                            QLabel {{
+                                background-color: rgba(120, 120, 128, 0.16);
+                                color: {t.text_primary};
+                                padding: 0px 6px;
+                                border: none;
+                                border-radius: 3px;
+                                font-size: 10px;
+                                font-weight: 500;
+                            }}
+                        """)
+                    groups_layout.addWidget(tag_label)
+                if len(account.groups) > 5:
+                    more_label = QLabel(f"+{len(account.groups) - 5}")
+                    more_label.setFixedHeight(18)
+                    more_label.setStyleSheet(f"color: {t.text_tertiary}; font-size: 10px;")
+                    groups_layout.addWidget(more_label)
+            else:
+                empty_label = QLabel("-")
+                empty_label.setStyleSheet(f"color: {t.text_tertiary};")
+                groups_layout.addWidget(empty_label)
+
+            groups_layout.addStretch()
+            self.table_view.setCellWidget(row, 6, groups_widget)
+            # Also set an empty item for background handling
+            groups_item = QTableWidgetItem()
+            groups_item.setData(Qt.ItemDataRole.UserRole + 1, account)
+            self.table_view.setItem(row, 6, groups_item)
+
+            # Notes column
+            notes_item = QTableWidgetItem(account.notes or "-")
+            notes_item.setForeground(QColor(t.text_secondary if account.notes else t.text_tertiary))
+            self.table_view.setItem(row, 7, notes_item)
+
+            # Apply row background based on selection state
+            is_row_selected = (row == self.selected_table_row)
+            is_multi_selected = self.multi_select_mode and self.selection_manager.is_selected(account)
+
+            if is_row_selected or is_multi_selected:
+                # Same as card selection: t.bg_hover
+                row_color = QColor(t.bg_hover)
+            else:
+                row_color = QColor(t.bg_primary)
+
+            row_brush = QBrush(row_color)
+            for col in range(8):
+                item = self.table_view.item(row, col)
+                if item:
+                    item.setBackground(row_brush)
+                # Also update cell widget background (for groups column)
+                widget = self.table_view.cellWidget(row, col)
+                if widget:
+                    widget.setAutoFillBackground(True)
+                    pal = widget.palette()
+                    pal.setColor(widget.backgroundRole(), row_color)
+                    widget.setPalette(pal)
+
+    def _handle_table_selection(self, account: Account, row: int) -> None:
+        """Unified table selection handler using SelectionManager.
+
+        Handles multi-select with Shift modifier key for both
+        cell clicks and checkbox clicks in table view.
+        """
+        modifiers = QApplication.keyboardModifiers()
+        shift_held = bool(modifiers & Qt.KeyboardModifier.ShiftModifier)
+
+        # Use SelectionManager with table accounts list
+        self.selection_manager.handle_click(account, row, self._table_accounts, shift_held)
+
+        self._refresh_table_view()
+        self._update_batch_bar()
+
+    def _on_table_cell_clicked(self, row: int, column: int) -> None:
+        """Handle table cell click - row selection and copy."""
+        t = get_theme()
+        zh = self.state.language == 'zh'
+
+        # Get account for this row
+        if not hasattr(self, '_table_accounts') or row >= len(self._table_accounts):
+            return
+        account = self._table_accounts[row]
+
+        # In multi-select mode, skip column 0 (checkbox column) - handled by checkbox click
+        if self.multi_select_mode and column == 0:
+            return
+
+        # In multi-select mode, use unified selection handler
+        if self.multi_select_mode:
+            self._handle_table_selection(account, row)
+            return
+
+        # Normal mode: Update row selection (highlight entire row in gray)
+        old_selected_row = self.selected_table_row
+        self.selected_table_row = row
+
+        # Update old row background to default
+        if old_selected_row >= 0 and old_selected_row != row:
+            default_brush = QBrush(QColor(t.bg_primary))
+            for col in range(8):
+                old_item = self.table_view.item(old_selected_row, col)
+                if old_item:
+                    old_item.setBackground(default_brush)
+                old_widget = self.table_view.cellWidget(old_selected_row, col)
+                if old_widget:
+                    old_widget.setAutoFillBackground(True)
+                    pal = old_widget.palette()
+                    pal.setColor(old_widget.backgroundRole(), QColor(t.bg_primary))
+                    old_widget.setPalette(pal)
+
+        # Update new row background (same as card selection: t.bg_hover)
+        selected_color = QColor(t.bg_hover)
+        selected_brush = QBrush(selected_color)
+        for col in range(8):
+            new_item = self.table_view.item(row, col)
+            if new_item:
+                new_item.setBackground(selected_brush)
+            new_widget = self.table_view.cellWidget(row, col)
+            if new_widget:
+                new_widget.setAutoFillBackground(True)
+                pal = new_widget.palette()
+                pal.setColor(new_widget.backgroundRole(), selected_color)
+                new_widget.setPalette(pal)
+
+        # Skip ID/checkbox column for copy
+        if column == 0:
+            self.table_view.repaint()
+            return
+
+        # Handle groups column - no copy, just select row (right-click for edit)
+        if column == 6:
+            self.table_view.repaint()
+            return
+
+        # Notes column - click to start inline editing
+        if column == 7:
+            self.table_view.repaint()
+            self._start_table_notes_edit(account, row)
+            return
+
+        # For other columns, copy to clipboard
+        item = self.table_view.item(row, column)
+        if not item:
+            return
+
+        # Get original (unmasked) value for columns 1-5
+        if column in [1, 2, 3, 4, 5]:
+            text = item.data(Qt.ItemDataRole.UserRole)
+        else:
+            text = item.text()
+
+        if text and text != "-":
+            # Copy to clipboard
+            clipboard = QApplication.clipboard()
+            clipboard.setText(text)
+
+            # Visual feedback - use theme-appropriate highlight color
+            is_dark = get_theme_manager().is_dark
+            highlight_color = "#6B5A20" if is_dark else "#FEF9C3"  # Warm amber for dark mode, light yellow for light
+            highlight_brush = QBrush(QColor(highlight_color))
+            item.setBackground(highlight_brush)
+            self.table_view.repaint()
+
+            def restore_bg():
+                # Restore to selected row color (t.bg_hover)
+                item.setBackground(QBrush(QColor(t.bg_hover)))
+                self.table_view.repaint()
+
+            QTimer.singleShot(500, restore_bg)
+
+            # Show toast
+            column_names = ["#", "邮箱" if zh else "Email", "密码" if zh else "Password",
+                          "辅助邮箱" if zh else "Backup", "2FA密钥" if zh else "2FA Key",
+                          "验证码" if zh else "Code", "分组" if zh else "Groups", "备注" if zh else "Notes"]
+            col_name = column_names[column] if column < len(column_names) else ""
+            self.toast.show_message(f"已复制 {col_name}" if zh else f"Copied {col_name}")
+        else:
+            self.table_view.repaint()
+
+    def _on_table_context_menu(self, pos) -> None:
+        """Handle right-click context menu on table."""
+        t = get_theme()
+        zh = self.state.language == 'zh'
+        ic = t.text_secondary
+
+        # Get the item at click position
+        item = self.table_view.itemAt(pos)
+        if not item:
+            return
+
+        row = item.row()
+        column = self.table_view.columnAt(pos.x())
+
+        # Get account for this row
+        if not hasattr(self, '_table_accounts') or row >= len(self._table_accounts):
+            return
+        account = self._table_accounts[row]
+
+        # Column 6 is groups column - show groups edit menu
+        if column == 6:
+            self._show_table_groups_edit_menu(account, pos)
+            return
+
+        # For other columns, show edit/delete menu
+        menu = QMenu(self)
+        menu.setStyleSheet(f"""
+            QMenu {{
+                background-color: {t.bg_primary};
+                border: 1px solid {t.border};
+                border-radius: 8px;
+                padding: 4px;
+            }}
+            QMenu::item {{
+                padding: 8px 16px;
+                border-radius: 4px;
+                color: {t.text_primary};
+            }}
+            QMenu::item:selected {{
+                background-color: {t.bg_hover};
+            }}
+        """)
+
+        # Column mapping: 0=checkbox/#, 1=email, 2=password, 3=backup, 4=secret, 5=code, 6=groups, 7=notes
+        # Note: column 5 (verification code) is not editable - it's auto-generated from secret
+        editable_columns = {
+            1: ("email", "邮箱" if zh else "Email"),
+            2: ("password", "密码" if zh else "Password"),
+            3: ("backup", "辅助邮箱" if zh else "Backup Email"),
+            4: ("secret", "2FA密钥" if zh else "2FA Secret"),
+            7: ("notes", "备注" if zh else "Notes"),
+        }
+
+        # Edit action for editable columns
+        if column in editable_columns:
+            field_name, field_label = editable_columns[column]
+            edit_action = menu.addAction(QIcon(icon_edit(14, ic)), f"编辑{field_label}" if zh else f"Edit {field_label}")
+            edit_action.triggered.connect(lambda: self._start_table_cell_edit(account, row, column, field_name))
+
+        # Copy action
+        copy_action = menu.addAction(QIcon(icon_copy(14, ic)), "复制" if zh else "Copy")
+        copy_action.triggered.connect(lambda: self._copy_table_cell(account, column))
+
+        menu.addSeparator()
+
+        # Delete row action
+        delete_action = menu.addAction(QIcon(icon_trash(14, t.error)), "删除账户" if zh else "Delete Account")
+        delete_action.triggered.connect(lambda: self._delete_single_account(account))
+
+        menu.exec(self.table_view.mapToGlobal(pos))
+
+    def _start_table_cell_edit(self, account: Account, row: int, column: int, field_name: str) -> None:
+        """Start inline editing for a table cell with expandable width."""
+        t = get_theme()
+        zh = self.state.language == 'zh'
+        is_dark = get_theme_manager().is_dark
+
+        # Get current value
+        current_value = getattr(account, field_name, '') or ''
+
+        # Get cell geometry
+        cell_rect = self.table_view.visualRect(self.table_view.model().index(row, column))
+
+        # Selection color (green)
+        selection_bg = "#065F46" if is_dark else "#10B981"
+        selection_color = "#FFFFFF"
+
+        # Create floating edit widget
+        # Use appropriate background for dark/light mode
+        edit_bg = "#374151" if is_dark else "#F3F4F6"
+        text_color = "#F9FAFB" if is_dark else "#111827"
+
+        edit = QLineEdit(self.table_view.viewport())
+        edit.setObjectName("tableCellEdit")
+        edit.setText(current_value)
+        edit.setAutoFillBackground(True)
+
+        # Use palette for reliable background color
+        from PyQt6.QtGui import QPalette, QColor
+        palette = edit.palette()
+        palette.setColor(QPalette.ColorRole.Base, QColor(edit_bg))
+        palette.setColor(QPalette.ColorRole.Text, QColor(text_color))
+        palette.setColor(QPalette.ColorRole.Highlight, QColor(selection_bg))
+        palette.setColor(QPalette.ColorRole.HighlightedText, QColor(selection_color))
+        edit.setPalette(palette)
+
+        edit.setStyleSheet(f"""
+            QLineEdit#tableCellEdit {{
+                background-color: {edit_bg};
+                color: {text_color};
+                border: none;
+                padding: 0px 8px;
+                selection-background-color: {selection_bg};
+                selection-color: {selection_color};
+            }}
+        """)
+
+        # Calculate width based on content
+        font_metrics = edit.fontMetrics()
+        text_width = font_metrics.horizontalAdvance(current_value) + 30  # padding
+        min_width = max(cell_rect.width(), text_width)
+        max_width = self.table_view.viewport().width() - cell_rect.x() - 5
+
+        edit.setFixedHeight(cell_rect.height())
+        edit.setMinimumWidth(min(min_width, max_width))
+        edit.move(cell_rect.x(), cell_rect.y())
+        edit.show()
+        edit.setFocus()
+        edit.selectAll()
+
+        def finish_edit():
+            if edit.isVisible():
+                new_value = edit.text().strip()
+                setattr(account, field_name, new_value)
+                edit.hide()
+                edit.deleteLater()
+                self._save_data()
+                self._refresh_table_view()
+
+        def cancel_edit():
+            edit.hide()
+            edit.deleteLater()
+            self._refresh_table_view()
+
+        edit.returnPressed.connect(finish_edit)
+
+        # Handle focus out
+        def on_focus_out(event):
+            finish_edit()
+        edit.focusOutEvent = on_focus_out
+
+        # Handle escape key
+        def key_press(event):
+            if event.key() == Qt.Key.Key_Escape:
+                cancel_edit()
+            else:
+                QLineEdit.keyPressEvent(edit, event)
+        edit.keyPressEvent = key_press
+
+    def _copy_table_cell(self, account: Account, column: int) -> None:
+        """Copy table cell value to clipboard."""
+        zh = self.state.language == 'zh'
+
+        # Column mapping: 0=checkbox/#, 1=email, 2=password, 3=backup, 4=secret, 5=code, 6=groups, 7=notes
+        if column == 5:
+            # Column 5 is verification code - generate it
+            code = self.totp_service.generate_code_safe(account.secret) if account.secret else ''
+            value = code
+        else:
+            column_fields = {
+                1: account.email,
+                2: account.password,
+                3: account.backup,
+                4: account.secret,
+                7: account.notes,
+            }
+            value = column_fields.get(column, '')
+
+        if value:
+            QApplication.clipboard().setText(value)
+            self.toast.show_message("已复制" if zh else "Copied", center=True)
+
+    def _show_table_groups_edit_menu(self, account, pos) -> None:
+        """Show groups edit menu for table row."""
+        t = get_theme()
+        zh = self.state.language == 'zh'
+
+        menu = QMenu(self)
+        menu.setStyleSheet(f"""
+            QMenu {{
+                background-color: {t.bg_primary};
+                border: 1px solid {t.border};
+                border-radius: 8px;
+                padding: 4px;
+            }}
+            QMenu::item {{
+                padding: 8px 16px;
+                border-radius: 4px;
+                color: {t.text_primary};
+            }}
+            QMenu::item:selected {{
+                background-color: {t.bg_hover};
+            }}
+            QMenu::item:disabled {{
+                color: {t.text_tertiary};
+            }}
+        """)
+
+        # Add to group submenu
+        add_menu = menu.addMenu("添加到分组" if zh else "Add to group")
+        for group in self.state.groups:
+            if group.name not in account.groups:
+                action = add_menu.addAction(group.name)
+                action.triggered.connect(lambda checked, g=group.name, a=account: self._table_add_to_group(a, g))
+
+        if not any(g.name not in account.groups for g in self.state.groups):
+            no_action = add_menu.addAction("无可用分组" if zh else "No available groups")
+            no_action.setEnabled(False)
+
+        # Remove from group submenu (only if account has groups)
+        if account.groups:
+            remove_menu = menu.addMenu("从分组移除" if zh else "Remove from group")
+            for group_name in account.groups:
+                action = remove_menu.addAction(group_name)
+                action.triggered.connect(lambda checked, g=group_name, a=account: self._table_remove_from_group(a, g))
+
+        menu.addSeparator()
+
+        # Delete account action
+        delete_action = menu.addAction(QIcon(icon_trash(14, t.error)), "删除账户" if zh else "Delete Account")
+        delete_action.triggered.connect(lambda: self._delete_single_account(account))
+
+        # Show at click position
+        menu.exec(self.table_view.mapToGlobal(pos))
+
+    def _table_add_to_group(self, account, group_name: str) -> None:
+        """Add account to group from table context menu."""
+        if group_name not in account.groups:
+            account.groups.append(group_name)
+            self._save_data()
+            self._refresh_table_view()
+
+    def _table_remove_from_group(self, account, group_name: str) -> None:
+        """Remove account from group from table context menu."""
+        if group_name in account.groups:
+            account.groups.remove(group_name)
+            self._save_data()
+            self._refresh_table_view()
+
+    def _start_table_notes_edit(self, account, row: int) -> None:
+        """Start inline editing for notes in table view."""
+        t = get_theme()
+        zh = self.state.language == 'zh'
+
+        # Create inline edit widget - no border, just color change
+        edit = QLineEdit()
+        edit.setText(account.notes or "")
+        edit.setPlaceholderText("添加备注..." if zh else "Add notes...")
+        edit.setStyleSheet(f"""
+            QLineEdit {{
+                background-color: {t.bg_hover};
+                color: {t.text_primary};
+                border: none;
+                padding: 0px 8px;
+            }}
+        """)
+
+        # Store reference for cleanup
+        self._table_notes_edit = edit
+        self._table_notes_account = account
+        self._table_notes_row = row
+        self._table_notes_editing = True
+
+        # Connect signals - Enter to save
+        edit.returnPressed.connect(self._finish_table_notes_edit)
+
+        # Set as cell widget
+        self.table_view.setCellWidget(row, 7, edit)
+        edit.setFocus()
+        edit.selectAll()
+
+    def _finish_table_notes_edit(self) -> None:
+        """Finish inline notes editing and save."""
+        if not hasattr(self, '_table_notes_editing') or not self._table_notes_editing:
+            return
+        if not hasattr(self, '_table_notes_edit') or not self._table_notes_edit:
+            return
+
+        # Mark as not editing first to prevent re-entry
+        self._table_notes_editing = False
+
+        edit = self._table_notes_edit
+        account = self._table_notes_account
+        row = self._table_notes_row
+
+        # Get new notes value
+        new_notes = edit.text().strip()
+
+        # Update account if changed
+        if new_notes != (account.notes or ""):
+            account.notes = new_notes if new_notes else None
+            self._save_data()
+
+        # Remove the cell widget first
+        self.table_view.removeCellWidget(row, 7)
+
+        # Clean up references
+        self._table_notes_edit = None
+        self._table_notes_account = None
+        self._table_notes_row = None
+
+        # Refresh to restore normal cell
+        self._refresh_table_view()
+
+        # Also update detail panel if this account is selected
+        if self.selected_account == account:
+            self._update_detail_panel()
+
+    def _on_table_checkbox_clicked(self, account, row: int) -> None:
+        """Handle table checkbox click for multi-select."""
+        if not hasattr(self, '_table_accounts'):
+            return
+        self._handle_table_selection(account, row)
+
+    def _mask_email(self, email: str) -> str:
+        """Mask email for privacy display."""
+        if not email or '@' not in email:
+            return email[:3] + "***" if email else ""
+        local, domain = email.split('@', 1)
+        return f"{local[:3]}***@{domain}"
+
+    def _show_settings_menu(self) -> None:
+        """Show/hide settings dropdown menu."""
+        if not self._should_show_menu("settings"):
+            return
+
+        t = get_theme()
+        zh = self.state.language == 'zh'
+
+        menu = QMenu(self)
+        self._settings_menu = menu
+        self._track_menu_close(menu, "settings")
+        menu.setStyleSheet(f"""
+            QMenu {{
+                background-color: {t.bg_secondary};
+                border: 1px solid {t.border};
+                border-radius: 8px;
+                padding: 8px;
+                min-width: 140px;
+            }}
+            QMenu::item {{
+                padding: 8px 16px;
+                border-radius: 4px;
+                color: {t.text_primary};
+            }}
+            QMenu::item:selected {{
+                background-color: {t.bg_hover};
+            }}
+            QMenu::separator {{
+                height: 1px;
+                background: {t.border};
+                margin: 4px 8px;
+            }}
+        """)
+
+        # Theme toggle - show what it will switch to
+        theme_text = "浅色模式" if self.theme_manager.is_dark else "深色模式"
+        if not zh:
+            theme_text = "Light Mode" if self.theme_manager.is_dark else "Dark Mode"
+        theme_action = menu.addAction(theme_text)
+        theme_action.triggered.connect(self._toggle_theme)
+
+        # Language toggle
+        lang_text = "切换为 English" if zh else "Switch to 中文"
+        lang_action = menu.addAction(lang_text)
+        lang_action.triggered.connect(self._toggle_language)
+
+        menu.addSeparator()
+
+        # Archive history
+        archive_action = menu.addAction("存档历史" if zh else "Archives")
+        archive_action.triggered.connect(self._show_archive_dialog)
+
+        # Trash
+        trash_count = len(self.state.trash) if hasattr(self.state, 'trash') else 0
+        trash_text = "回收站" if zh else "Trash"
+        if trash_count > 0:
+            trash_text += f" ({trash_count})"
+        trash_action = menu.addAction(trash_text)
+        trash_action.triggered.connect(self._show_trash_dialog)
+
+        # Position: bottom-left of button
+        btn_rect = self.btn_settings.rect()
+        global_pos = self.btn_settings.mapToGlobal(btn_rect.bottomLeft())
+        menu_width = 160
+        global_pos.setX(global_pos.x() - menu_width + btn_rect.width())
+
+        menu.aboutToHide.connect(lambda: setattr(self, '_settings_menu', None))
+        menu.exec(global_pos)
+
+    def _show_import_dialog(self) -> None:
+        """Show import dialog for batch importing accounts."""
+        from .dialogs.import_dialog import ImportDialog
+
+        dialog = ImportDialog(self, language=self.state.language)
+
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            accounts = dialog.get_accounts()
+            if accounts:
+                zh = self.state.language == 'zh'
+
+                # Check for duplicates (by email)
+                existing_emails = {a.email.lower() for a in self.state.accounts}
+                duplicates = [a for a in accounts if a.email.lower() in existing_emails]
+                new_accounts = [a for a in accounts if a.email.lower() not in existing_emails]
+
+                accounts_to_import = []
+                updated_count = 0
+
+                if duplicates:
+                    # Show duplicate handling dialog
+                    action = self._show_duplicate_dialog(len(duplicates), len(new_accounts))
+
+                    if action == "cancel":
+                        return
+                    elif action == "skip":
+                        # Only import non-duplicates
+                        accounts_to_import = new_accounts
+                    elif action == "update":
+                        # Update existing accounts with new data, then add new ones
+                        for dup_account in duplicates:
+                            for existing in self.state.accounts:
+                                if existing.email.lower() == dup_account.email.lower():
+                                    # Update existing account with new data
+                                    existing.password = dup_account.password or existing.password
+                                    existing.secret = dup_account.secret or existing.secret
+                                    if hasattr(dup_account, 'backup'):
+                                        existing.backup = dup_account.backup or getattr(existing, 'backup', '')
+                                    break
+                        accounts_to_import = new_accounts
+                        updated_count = len(duplicates)
+                    else:  # "all" - import all including duplicates
+                        accounts_to_import = accounts
+                else:
+                    accounts_to_import = accounts
+
+                if accounts_to_import:
+                    # Add imported accounts
+                    max_id = max((a.id or 0 for a in self.state.accounts), default=0)
+                    for i, account in enumerate(accounts_to_import):
+                        account.id = max_id + i + 1
+                        self.state.accounts.append(account)
+
+                self._save_data()
+                self._refresh_groups()
+                self._refresh_account_list()
+
+                # Show result message
+                imported_count = len(accounts_to_import)
+
+                if updated_count > 0:
+                    msg = f"已导入 {imported_count} 个，更新 {updated_count} 个账户" if zh else f"Imported {imported_count}, updated {updated_count} accounts"
+                elif imported_count > 0:
+                    msg = f"已导入 {imported_count} 个账户" if zh else f"Imported {imported_count} accounts"
+                else:
+                    msg = "没有新账户导入" if zh else "No new accounts imported"
+                self.toast.show_message(msg)
+
+    def _show_duplicate_dialog(self, dup_count: int, new_count: int) -> str:
+        """Show dialog to handle duplicate accounts. Returns: 'skip', 'update', 'all', or 'cancel'."""
+        zh = self.state.language == 'zh'
+        t = get_theme()
 
         dialog = QDialog(self)
-        dialog.setWindowTitle(self.tr('trash_title').format(len(self.state.trash)))
-        dialog.resize(800, 400)
+        dialog.setWindowTitle("检测到重复账户" if zh else "Duplicates Detected")
+        dialog.setModal(True)
+        dialog.setFixedWidth(400)
+
         layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(24, 20, 24, 20)
+        layout.setSpacing(16)
 
-        # Create table for trash items
-        trash_table = QTableWidget()
-        trash_table.setColumnCount(6)
-        trash_table.setHorizontalHeaderLabels([
-            "", self.tr('email'), self.tr('password'), self.tr('secondary_email'),
-            self.tr('2fa_key'), self.tr('import_time')
-        ])
-        trash_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
-        trash_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        trash_table.setColumnWidth(0, 45)
-        trash_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        trash_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        trash_table.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        trash_table.verticalHeader().setDefaultSectionSize(50)
-        trash_table.verticalHeader().setVisible(False)
-        trash_table.setStyleSheet("""
-            QTableWidget {
-                gridline-color: #E5E7EB;
-                border: 1px solid #E5E7EB;
-                border-radius: 8px;
-            }
-            QTableWidget::item {
-                padding: 8px;
-            }
-            QTableWidget::item:selected {
-                background-color: #DBEAFE;
-                color: #1E40AF;
-            }
-            QHeaderView::section {
-                background-color: #F3F4F6;
-                padding: 8px;
+        # Message
+        msg = QLabel(
+            f"发现 {dup_count} 个重复账户（邮箱已存在）\n另有 {new_count} 个新账户\n\n请选择处理方式：" if zh else
+            f"Found {dup_count} duplicate accounts (email exists)\nand {new_count} new accounts\n\nHow to handle duplicates?"
+        )
+        msg.setWordWrap(True)
+        msg.setStyleSheet(f"font-size: 14px; color: {t.text_primary};")
+        layout.addWidget(msg)
+
+        result = {"action": "cancel"}
+
+        # Button style
+        btn_style = f"""
+            QPushButton {{
+                background-color: {t.bg_secondary};
+                border: 1px solid {t.border};
+                border-radius: 6px;
+                padding: 10px 16px;
+                font-size: 13px;
+                color: {t.text_primary};
+                text-align: left;
+            }}
+            QPushButton:hover {{
+                background-color: {t.bg_hover};
+            }}
+        """
+
+        # Skip button
+        btn_skip = QPushButton("跳过重复，只导入新账户" if zh else "Skip duplicates, import new only")
+        btn_skip.setStyleSheet(btn_style)
+        btn_skip.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_skip.clicked.connect(lambda: (result.update({"action": "skip"}), dialog.accept()))
+        layout.addWidget(btn_skip)
+
+        # Update button
+        btn_update = QPushButton("更新重复项，并导入新账户" if zh else "Update duplicates and import new")
+        btn_update.setStyleSheet(btn_style)
+        btn_update.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_update.clicked.connect(lambda: (result.update({"action": "update"}), dialog.accept()))
+        layout.addWidget(btn_update)
+
+        # Import all button
+        btn_all = QPushButton("全部导入（允许重复）" if zh else "Import all (allow duplicates)")
+        btn_all.setStyleSheet(btn_style)
+        btn_all.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_all.clicked.connect(lambda: (result.update({"action": "all"}), dialog.accept()))
+        layout.addWidget(btn_all)
+
+        # Cancel button
+        layout.addSpacing(8)
+        btn_cancel = QPushButton("取消" if zh else "Cancel")
+        btn_cancel.setStyleSheet(f"""
+            QPushButton {{
+                background-color: transparent;
                 border: none;
-                border-bottom: 2px solid #E5E7EB;
-                font-weight: bold;
-            }
+                padding: 8px;
+                font-size: 13px;
+                color: {t.text_tertiary};
+            }}
+            QPushButton:hover {{
+                color: {t.text_secondary};
+            }}
         """)
+        btn_cancel.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_cancel.clicked.connect(dialog.reject)
+        layout.addWidget(btn_cancel, alignment=Qt.AlignmentFlag.AlignCenter)
 
-        # Header checkbox for select all
-        header_checkbox_widget = QWidget(trash_table.horizontalHeader())
-        header_checkbox_widget.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
-        header_checkbox_layout = QHBoxLayout(header_checkbox_widget)
-        header_checkbox_layout.setContentsMargins(0, 0, 0, 0)
-        header_checkbox_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        header_checkbox = QCheckBox()
-        header_checkbox.setStyleSheet(f"""
-            QCheckBox::indicator {{
-                width: 18px;
-                height: 18px;
-                border: 2px solid #CBD5E1;
+        dialog.setStyleSheet(f"QDialog {{ background-color: {t.bg_primary}; }}")
+        dialog.exec()
+
+        return result["action"]
+
+    def _show_add_account(self) -> None:
+        """Show add account dialog."""
+        from .dialogs.account_dialog import AccountDialog
+
+        dialog = AccountDialog(
+            self,
+            account=None,
+            groups=self.state.groups,
+            language=self.state.language
+        )
+
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            account = dialog.get_account()
+            if account:
+                # Generate ID
+                max_id = max((a.id or 0 for a in self.state.accounts), default=0)
+                account.id = max_id + 1
+
+                self.state.accounts.append(account)
+                self._save_data()
+                self._refresh_groups()
+                self._refresh_account_list()
+
+                # Select the new account
+                self.selected_account = account
+                self._highlight_selected_account()
+                self._update_detail_panel()
+
+                zh = self.state.language == 'zh'
+                self.toast.show_message("已添加账户" if zh else "Account added")
+
+    def _edit_account(self) -> None:
+        """Toggle inline edit mode for selected account."""
+        if not self.selected_account:
+            return
+
+        t = get_theme()
+        zh = self.state.language == 'zh'
+
+        if self.detail_edit_mode:
+            # Save changes and exit edit mode
+            self._save_edited_account()
+            self.detail_edit_mode = False
+            self.btn_edit.setIcon(QIcon(icon_edit(14, t.text_secondary)))
+            self._update_detail_fields()
+            self.toast.show_message("已保存" if zh else "Saved")
+        else:
+            # Enter edit mode
+            self.detail_edit_mode = True
+            self.btn_edit.setIcon(QIcon(icon_check(14, t.success)))
+            self._update_detail_fields()
+
+    def _save_edited_account(self) -> None:
+        """Save changes from editable fields to the account."""
+        if not self.selected_account or not self.editable_fields:
+            return
+
+        changed = False
+
+        if 'email' in self.editable_fields:
+            new_email = self.editable_fields['email'].text().strip()
+            if new_email and new_email != self.selected_account.email:
+                self.selected_account.email = new_email
+                changed = True
+
+        if 'password' in self.editable_fields:
+            new_pwd = self.editable_fields['password'].text()
+            if new_pwd != self.selected_account.password:
+                self.selected_account.password = new_pwd
+                changed = True
+
+        if 'backup' in self.editable_fields:
+            new_backup = self.editable_fields['backup'].text().strip()
+            if hasattr(self.selected_account, 'backup'):
+                if new_backup != self.selected_account.backup:
+                    self.selected_account.backup = new_backup
+                    changed = True
+
+        if 'secret' in self.editable_fields:
+            new_secret = self.editable_fields['secret'].text().strip()
+            if new_secret != self.selected_account.secret:
+                self.selected_account.secret = new_secret
+                changed = True
+
+        if changed:
+            self._save_data()
+            self._refresh_account_list()
+
+    def _open_tag_editor(self) -> None:
+        """Show inline tag editor menu for the selected account."""
+        if not self.selected_account:
+            return
+
+        t = get_theme()
+        zh = self.state.language == 'zh'
+
+        menu = QMenu(self)
+        menu.setStyleSheet(f"""
+            QMenu {{
+                background-color: {t.bg_secondary};
+                border: 1px solid {t.border};
+                border-radius: 8px;
+                padding: 4px;
+            }}
+            QMenu::item {{
+                padding: 8px 16px;
                 border-radius: 4px;
-                background-color: #FFFFFF;
+                color: {t.text_primary};
             }}
-            QCheckBox::indicator:hover {{
-                border-color: #3B82F6;
-                background-color: #EFF6FF;
-            }}
-            QCheckBox::indicator:checked {{
-                background-color: #3B82F6;
-                border-color: #3B82F6;
-                image: url({CHECK_SVG_PATH});
-            }}
-            QCheckBox::indicator:checked:hover {{
-                background-color: #2563EB;
-                border-color: #2563EB;
+            QMenu::item:selected {{
+                background-color: {t.bg_hover};
             }}
         """)
-        header_checkbox_layout.addWidget(header_checkbox)
 
-        def update_header_checkbox_position():
-            header = trash_table.horizontalHeader()
-            col_width = header.sectionSize(0)
-            header_height = header.height()
-            # First column always starts at x=0
-            header_checkbox_widget.setGeometry(0, 0, col_width, header_height)
+        # Add existing groups as checkable items
+        for group in self.state.groups:
+            action = menu.addAction(group.name)
+            action.setCheckable(True)
+            action.setChecked(group.name in self.selected_account.groups)
+            action.toggled.connect(lambda checked, g=group.name: self._toggle_account_tag(g, checked))
 
-        def on_header_checkbox_changed(state):
-            is_checked = state == Qt.CheckState.Checked.value
-            for row in range(trash_table.rowCount()):
-                widget = trash_table.cellWidget(row, 0)
-                if widget:
-                    cb = widget.findChild(QCheckBox)
-                    if cb:
-                        cb.blockSignals(True)
-                        cb.setChecked(is_checked)
-                        cb.blockSignals(False)
+        if self.state.groups:
+            menu.addSeparator()
 
-        header_checkbox.stateChanged.connect(on_header_checkbox_changed)
+        # Add "New group" option
+        new_action = menu.addAction("+ " + ("新建分组" if zh else "New group"))
+        new_action.triggered.connect(self._add_new_tag_to_account)
 
-        # Fill table with trash items
-        for i, acc in enumerate(self.state.trash):
-            trash_table.insertRow(i)
+        # Show menu at cursor position
+        menu.exec(QApplication.instance().activeWindow().cursor().pos())
 
-            # Checkbox
-            checkbox_widget = QWidget()
-            checkbox_layout = QHBoxLayout(checkbox_widget)
-            checkbox_layout.setContentsMargins(0, 0, 0, 0)
-            checkbox_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            checkbox = QCheckBox()
-            checkbox.setStyleSheet(f"""
-                QCheckBox::indicator {{
-                    width: 18px;
-                    height: 18px;
-                    border: 2px solid #CBD5E1;
-                    border-radius: 4px;
-                    background-color: #FFFFFF;
-                }}
-                QCheckBox::indicator:hover {{
-                    border-color: #3B82F6;
-                    background-color: #EFF6FF;
-                }}
-                QCheckBox::indicator:checked {{
-                    background-color: #3B82F6;
-                    border-color: #3B82F6;
-                    image: url({CHECK_SVG_PATH});
-                }}
-                QCheckBox::indicator:checked:hover {{
-                    background-color: #2563EB;
-                    border-color: #2563EB;
-                }}
-            """)
-            checkbox_layout.addWidget(checkbox)
-            trash_table.setCellWidget(i, 0, checkbox_widget)
+    def _toggle_account_tag(self, group_name: str, checked: bool) -> None:
+        """Toggle a tag on the selected account."""
+        if not self.selected_account:
+            return
 
-            trash_table.setItem(i, 1, QTableWidgetItem(acc.email or ''))
-            trash_table.setItem(i, 2, QTableWidgetItem(acc.password or ''))
-            trash_table.setItem(i, 3, QTableWidgetItem(acc.backup or ''))
-            secret = acc.secret or ''
-            display_secret = secret[:6] + "..." + secret[-4:] if len(secret) > 10 else secret
-            secret_item = QTableWidgetItem(display_secret)
-            secret_item.setData(Qt.ItemDataRole.UserRole, secret)
-            trash_table.setItem(i, 4, secret_item)
-            trash_table.setItem(i, 5, QTableWidgetItem(acc.import_time or ''))
+        if checked:
+            if group_name not in self.selected_account.groups:
+                self.selected_account.groups.append(group_name)
+        else:
+            if group_name in self.selected_account.groups:
+                self.selected_account.groups.remove(group_name)
 
-        layout.addWidget(trash_table)
+        self._save_data()
+        self._refresh_groups()
+        self._refresh_account_list()
+        self._update_detail_panel()
+
+    def _create_inline_tag(self) -> None:
+        """Create a new group from inline input and add it to the selected account."""
+        if not self.selected_account or not hasattr(self, 'new_tag_input'):
+            return
+
+        name = self.new_tag_input.text().strip()
+        if not name:
+            return
+
+        # Check if group already exists
+        existing = next((g for g in self.state.groups if g.name == name), None)
+        if not existing:
+            # Create new group
+            new_group = Group(name=name, color="blue")
+            self.state.groups.append(new_group)
+
+        # Add to account
+        if name not in self.selected_account.groups:
+            self.selected_account.groups.append(name)
+
+        self.new_tag_input.clear()
+        self._save_data()
+        self._refresh_groups()
+        self._refresh_account_list()
+        self._update_detail_panel()
+
+    def _on_tag_input_finished(self) -> None:
+        """Handle when tag input loses focus - save if has content, otherwise cancel."""
+        if hasattr(self, 'new_tag_input'):
+            if self.new_tag_input.text().strip():
+                self._create_inline_tag()
+            else:
+                self.new_tag_input.clear()
+                self.new_tag_input.setFixedWidth(36)
+
+    def _on_tag_input_text_changed(self, text: str) -> None:
+        """Auto-expand tag input based on text content."""
+        if not hasattr(self, 'new_tag_input'):
+            return
+        if text:
+            # Calculate width based on text with extra padding for visibility
+            fm = self.new_tag_input.fontMetrics()
+            text_width = fm.horizontalAdvance(text) + 32  # padding + margin
+            new_width = max(36, min(text_width, 150))
+            self.new_tag_input.setFixedWidth(new_width)
+        else:
+            self.new_tag_input.setFixedWidth(36)
+
+    def _show_tag_context_menu(self, pos, group_name: str, btn: QPushButton) -> None:
+        """Show context menu for tag with delete option."""
+        t = get_theme()
+        menu = QMenu(self)
+        menu.setStyleSheet(f"""
+            QMenu {{
+                background-color: {t.bg_secondary};
+                border: 1px solid {t.border};
+                border-radius: 8px;
+                padding: 4px;
+            }}
+            QMenu::item {{
+                padding: 8px 16px;
+                border-radius: 4px;
+                color: {t.text_primary};
+            }}
+            QMenu::item:selected {{
+                background-color: {t.bg_hover};
+            }}
+        """)
+
+        zh = self.state.language == 'zh'
+        delete_action = menu.addAction("删除标签" if zh else "Delete Tag")
+        delete_action.triggered.connect(lambda: self._delete_tag(group_name))
+
+        menu.exec(btn.mapToGlobal(pos))
+
+    def _delete_tag(self, group_name: str) -> None:
+        """Delete a tag/group from the system with confirmation and undo."""
+        zh = self.state.language == 'zh'
+        t = get_theme()
+        is_dark = get_theme_manager().is_dark
+
+        # Count accounts using this group
+        count = sum(1 for acc in self.state.accounts if group_name in acc.groups)
+
+        # Dark mode: use colors matching library panel (softer grays)
+        # Light mode: use standard theme colors
+        dialog_bg = "#374151" if is_dark else t.bg_primary
+        text_color = "#F3F4F6" if is_dark else t.text_primary
+        cancel_bg = "#4B5563" if is_dark else t.bg_tertiary
+        cancel_hover = "#6B7280" if is_dark else t.bg_hover
+        error_color = "#DC2626" if is_dark else t.error
+        error_hover = "#B91C1C" if is_dark else "#DC2626"
+
+        # Create styled confirmation dialog
+        dialog = QDialog(self)
+        dialog.setWindowTitle("确认删除" if zh else "Confirm Delete")
+        dialog.setFixedWidth(320)
+
+        dialog.setStyleSheet(f"""
+            QDialog {{
+                background-color: {dialog_bg};
+                border-radius: 8px;
+            }}
+            QLabel {{
+                color: {text_color};
+                font-size: 13px;
+            }}
+            QPushButton {{
+                padding: 8px 16px;
+                border-radius: 6px;
+                font-size: 13px;
+                font-weight: 500;
+            }}
+        """)
+
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setSpacing(16)
+
+        # Message
+        msg = f"确定要删除标签「{group_name}」吗？" if zh else f"Delete tag '{group_name}'?"
+        if count > 0:
+            msg += f"\n\n{count} 个账户正在使用此标签" if zh else f"\n\n{count} accounts use this tag"
+
+        label = QLabel(msg)
+        label.setWordWrap(True)
+        layout.addWidget(label)
 
         # Buttons
         btn_layout = QHBoxLayout()
+        btn_layout.setSpacing(8)
 
-        btn_restore = QPushButton(self.tr('restore'))
-        btn_restore.setFixedHeight(36)
-        btn_restore.setIcon(QIcon(create_restore_icon(18, '#FFFFFF')))
-        btn_restore.setIconSize(QSize(18, 18))
-        btn_restore.setStyleSheet("""
-            QPushButton {
-                background-color: #10B981; color: white; font-weight: bold;
-                border: none; border-radius: 6px; padding: 0 15px;
-            }
-            QPushButton:hover { background-color: #059669; }
+        cancel_btn = QPushButton("取消" if zh else "Cancel")
+        cancel_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {cancel_bg};
+                border: none;
+                color: {text_color};
+            }}
+            QPushButton:hover {{
+                background-color: {cancel_hover};
+            }}
         """)
-        btn_layout.addWidget(btn_restore)
+        cancel_btn.clicked.connect(dialog.reject)
+        btn_layout.addWidget(cancel_btn)
 
-        btn_delete = QPushButton(self.tr('delete_permanent') if 'delete_permanent' in TRANSLATIONS.get('en', {}) else "永久删除")
-        btn_delete.setFixedHeight(36)
-        btn_delete.setIcon(QIcon(create_close_icon(18, '#FFFFFF')))
-        btn_delete.setIconSize(QSize(18, 18))
-        btn_delete.setStyleSheet("""
-            QPushButton {
-                background-color: #EF4444; color: white; font-weight: bold;
-                border: none; border-radius: 6px; padding: 0 15px;
-            }
-            QPushButton:hover { background-color: #DC2626; }
+        delete_btn = QPushButton("删除" if zh else "Delete")
+        delete_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {error_color};
+                border: none;
+                color: white;
+            }}
+            QPushButton:hover {{
+                background-color: {error_hover};
+            }}
         """)
-        btn_layout.addWidget(btn_delete)
-
-        btn_clear = QPushButton(self.tr('clear_trash'))
-        btn_clear.setFixedHeight(36)
-        btn_clear.setIcon(QIcon(create_trash_icon(18, '#FFFFFF')))
-        btn_clear.setIconSize(QSize(18, 18))
-        btn_clear.setStyleSheet("""
-            QPushButton {
-                background-color: #6B7280; color: white; font-weight: bold;
-                border: none; border-radius: 6px; padding: 0 15px;
-            }
-            QPushButton:hover { background-color: #4B5563; }
-        """)
-        btn_layout.addWidget(btn_clear)
+        delete_btn.clicked.connect(dialog.accept)
+        btn_layout.addWidget(delete_btn)
 
         layout.addLayout(btn_layout)
 
-        def get_checked_rows():
-            """Get list of checked row indices."""
-            checked = []
-            for row in range(trash_table.rowCount()):
-                widget = trash_table.cellWidget(row, 0)
-                if widget:
-                    checkbox = widget.findChild(QCheckBox)
-                    if checkbox and checkbox.isChecked():
-                        checked.append(row)
-            return checked
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
 
-        def restore_selected():
-            rows = get_checked_rows()
-            if not rows:
-                return
-            for row in sorted(rows, reverse=True):
-                if row < len(self.state.trash):
-                    acc = self.state.trash[row]
-                    self.account_service.restore_from_trash(acc.id)
-                    trash_table.removeRow(row)
-            self._save_data()
-            self._load_accounts_to_table()
-            self._refresh_group_list()
-            if not self.state.trash:
-                dialog.close()
-            else:
-                dialog.setWindowTitle(self.tr('trash_title').format(len(self.state.trash)))
+        # Backup for undo
+        deleted_group = next((g for g in self.state.groups if g.name == group_name), None)
+        affected_accounts = [(acc.id, list(acc.groups)) for acc in self.state.accounts if group_name in acc.groups]
+        group_index = next((i for i, g in enumerate(self.state.groups) if g.name == group_name), 0)
 
-        def delete_selected():
-            rows = get_checked_rows()
-            if not rows:
-                return
-            for row in sorted(rows, reverse=True):
-                if row < len(self.state.trash):
-                    self.state.trash.pop(row)
-                    trash_table.removeRow(row)
-            self._save_data()
-            self._refresh_group_list()
-            if not self.state.trash:
-                dialog.close()
-            else:
-                dialog.setWindowTitle(self.tr('trash_title').format(len(self.state.trash)))
+        # Remove from all accounts
+        for acc in self.state.accounts:
+            if group_name in acc.groups:
+                acc.groups.remove(group_name)
 
-        def clear_all_trash():
-            reply = QMessageBox.question(
-                dialog, self.tr('confirm_empty_trash'),
-                self.tr('confirm_empty_trash_msg').format(len(self.state.trash)),
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
-            )
-            if reply == QMessageBox.StandardButton.Yes:
-                self.account_service.empty_trash()
+        # Remove from groups list
+        self.state.groups = [g for g in self.state.groups if g.name != group_name]
+
+        self._save_data()
+        self._refresh_groups()
+        self._refresh_account_list()
+        self._update_detail_panel()
+
+        def undo_delete():
+            """Undo the tag deletion."""
+            if deleted_group:
+                # Restore group at original position
+                self.state.groups.insert(group_index, deleted_group)
+                # Restore group to affected accounts
+                for acc_id, original_groups in affected_accounts:
+                    acc = next((a for a in self.state.accounts if a.id == acc_id), None)
+                    if acc:
+                        acc.groups = original_groups
                 self._save_data()
-                self._refresh_group_list()
-                dialog.accept()
+                self._refresh_groups()
+                self._refresh_account_list()
+                self._update_detail_panel()
+                self.toast.show_message(f"已恢复「{group_name}」" if zh else f"Restored '{group_name}'")
 
-        btn_restore.clicked.connect(restore_selected)
-        btn_delete.clicked.connect(delete_selected)
-        btn_clear.clicked.connect(clear_all_trash)
+        # Show toast with undo option
+        self.toast.show_message(
+            f"已删除标签「{group_name}」" if zh else f"Deleted tag '{group_name}'",
+            duration=5000,
+            action_text="撤销" if zh else "Undo",
+            action_callback=undo_delete
+        )
 
-        # Show dialog and position header checkbox
-        dialog.show()
-        QApplication.processEvents()
-        update_header_checkbox_position()
-        dialog.exec()
+    def _on_detail_panel_click(self, event) -> None:
+        """Clear focus when clicking on detail panel background."""
+        focused = self.focusWidget()
+        if isinstance(focused, QLineEdit):
+            focused.clearFocus()
 
+    def _delete_account(self) -> None:
+        """Delete selected account with undo support."""
+        if not self.selected_account:
+            return
 
-def run_app():
-    """Run the application."""
-    app = QApplication(sys.argv)
-    app.setStyle('Fusion')
+        zh = self.state.language == 'zh'
+        msg = f"确定要删除账户 {self.selected_account.email} 吗？" if zh else f"Delete account {self.selected_account.email}?"
 
-    window = MainWindow()
-    window.show()
+        if not self._show_delete_confirmation(msg):
+            return
 
-    sys.exit(app.exec())
+        # Store for undo
+        deleted_account = self.selected_account
 
+        # Move to trash instead of permanent delete
+        if hasattr(self.state, 'trash'):
+            self.state.trash.append(self.selected_account)
 
-if __name__ == "__main__":
-    run_app()
+        self.state.accounts.remove(self.selected_account)
+        self.selected_account = None
+
+        self._save_data()
+        self._refresh_groups()
+        self._refresh_account_list()
+        self._update_detail_panel()
+
+        # Undo callback
+        def undo_delete():
+            if hasattr(self.state, 'trash') and deleted_account in self.state.trash:
+                self.state.trash.remove(deleted_account)
+            self.state.accounts.append(deleted_account)
+            self.selected_account = deleted_account
+            self._save_data()
+            self._refresh_groups()
+            self._refresh_account_list()
+            self._update_detail_panel()
+            self.toast.show_message("已恢复" if zh else "Restored")
+
+        # Show toast with undo
+        self.toast.show_message(
+            "已删除账户" if zh else "Account deleted",
+            duration=4000,
+            action_text="撤回" if zh else "Undo",
+            action_callback=undo_delete
+        )
+
+    def _copy_totp_code(self) -> None:
+        """Copy TOTP code to clipboard."""
+        if not self.selected_account or not self.selected_account.secret:
+            return
+
+        zh = self.state.language == 'zh'
+        code = self.totp_service.generate_code_safe(self.selected_account.secret)
+        if code:
+            QApplication.clipboard().setText(code)
+
+            t = get_theme()
+            self.btn_copy_totp.setIcon(QIcon(icon_check(18, t.success)))
+
+            # Show toast notification
+            self.toast.show_message("已复制：验证码" if zh else "Copied: Verification Code", center=True)
+
+            if self.copied_toast_timer:
+                self.copied_toast_timer.stop()
+
+            self.copied_toast_timer = QTimer(self)
+            self.copied_toast_timer.setSingleShot(True)
+            self.copied_toast_timer.timeout.connect(
+                lambda: self.btn_copy_totp.setIcon(QIcon(icon_copy(18, t.text_secondary)))
+            )
+            self.copied_toast_timer.start(2000)
+
+    def _save_data(self) -> None:
+        """Save application data."""
+        self.state.theme = self.theme_manager.mode.value
+        current = self.library_service.get_current_library()
+        self.library_service.save_library_state(current, self.state)
+
+    def mousePressEvent(self, event) -> None:
+        """Clear focus from inputs when clicking elsewhere."""
+        focused = self.focusWidget()
+        if isinstance(focused, QLineEdit):
+            focused.clearFocus()
+        super().mousePressEvent(event)
+
+    def closeEvent(self, event) -> None:
+        """Handle window close - auto archive and save."""
+        # Save current data
+        self._save_data()
+
+        # Create archive
+        try:
+            self.archive_service.create_archive(self.state)
+            logger.info("Auto-archived on exit")
+        except Exception as e:
+            logger.error(f"Failed to create archive on exit: {e}")
+
+        event.accept()

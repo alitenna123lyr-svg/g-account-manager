@@ -67,3 +67,23 @@ class ImportError(AppError):
         if line_number is not None:
             message += f" at line {line_number}"
         super().__init__(message)
+
+
+class ArchiveError(AppError):
+    """Raised when archive operation fails."""
+
+    def __init__(self, message: str = "Archive operation failed", cause: Exception | None = None):
+        self.cause = cause
+        if cause:
+            message += f" ({cause})"
+        super().__init__(message)
+
+
+class LibraryError(AppError):
+    """Raised when library operation fails."""
+
+    def __init__(self, message: str = "Library operation failed", cause: Exception | None = None):
+        self.cause = cause
+        if cause:
+            message += f" ({cause})"
+        super().__init__(message)

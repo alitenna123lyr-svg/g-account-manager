@@ -5,7 +5,7 @@ Group data model.
 from dataclasses import dataclass
 from typing import Optional
 
-from ..config.constants import GROUP_COLORS, GROUP_COLOR_NAMES, EMOJI_TO_COLOR_NAME
+from ..config.constants import GROUP_COLORS, GROUP_COLORS_DARK, GROUP_COLOR_NAMES, EMOJI_TO_COLOR_NAME
 
 
 @dataclass
@@ -31,10 +31,21 @@ class Group:
 
     @property
     def color_hex(self) -> str:
-        """Get the hex color code for this group."""
+        """Get the hex color code for this group (light mode)."""
         if self.color.startswith('#'):
             return self.color
         return GROUP_COLORS.get(self.color, '#808080')
+
+    @property
+    def color_hex_dark(self) -> str:
+        """Get the hex color code for dark mode."""
+        if self.color.startswith('#'):
+            return self.color
+        return GROUP_COLORS_DARK.get(self.color, '#808080')
+
+    def get_color_for_theme(self, is_dark: bool) -> str:
+        """Get the appropriate color hex for the current theme."""
+        return self.color_hex_dark if is_dark else self.color_hex
 
     def to_dict(self) -> dict:
         """Convert group to dictionary for JSON serialization."""

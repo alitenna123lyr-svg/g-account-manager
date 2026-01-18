@@ -21,6 +21,18 @@ class Settings:
     BACKUP_PREFIX: Final[str] = "2fa_data_backup_"
     BACKUP_SUFFIX: Final[str] = ".json"
 
+    # Archive settings
+    ARCHIVE_DIR: Final[Path] = _PROJECT_ROOT / "archives"
+    MAX_ARCHIVES: Final[int] = 50
+    ARCHIVE_PREFIX: Final[str] = "archive_"
+    ARCHIVE_INDEX_FILE: Final[str] = "archive_index.json"
+
+    # Library settings (multi-account library)
+    DATA_DIR: Final[Path] = _PROJECT_ROOT / "data"
+    LIBRARIES_INDEX_FILE: Final[str] = "libraries.json"
+    DEFAULT_LIBRARY_ID: Final[str] = "default"
+    DEFAULT_LIBRARY_NAME: Final[str] = "默认"
+
     # TOTP settings
     TOTP_PERIOD: Final[int] = 30
     TOTP_DIGITS: Final[int] = 6
@@ -53,3 +65,25 @@ class Settings:
         """Ensure backup directory exists and return its path."""
         cls.BACKUP_DIR.mkdir(parents=True, exist_ok=True)
         return cls.BACKUP_DIR
+
+    @classmethod
+    def ensure_archive_dir(cls) -> Path:
+        """Ensure archive directory exists and return its path."""
+        cls.ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
+        return cls.ARCHIVE_DIR
+
+    @classmethod
+    def ensure_data_dir(cls) -> Path:
+        """Ensure data directory exists and return its path."""
+        cls.DATA_DIR.mkdir(parents=True, exist_ok=True)
+        return cls.DATA_DIR
+
+    @classmethod
+    def get_archive_dir_path(cls) -> str:
+        """Get the archive directory path as string."""
+        return str(cls.ARCHIVE_DIR)
+
+    @classmethod
+    def get_data_dir_path(cls) -> str:
+        """Get the data directory path as string."""
+        return str(cls.DATA_DIR)

@@ -93,6 +93,21 @@ class TimeService:
         self._time_offset = self._calculate_offset()
         return self._time_offset
 
+    def get_remaining_seconds(self, period: int = 30) -> int:
+        """
+        Get remaining seconds until next TOTP period.
+
+        Args:
+            period: TOTP period in seconds (default 30).
+
+        Returns:
+            Remaining seconds (1-30).
+        """
+        current_time = self.get_accurate_time()
+        elapsed = int(current_time) % period
+        remaining = period - elapsed
+        return remaining if remaining > 0 else period
+
 
 # Global singleton instance
 _time_service: Optional[TimeService] = None
